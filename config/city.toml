@@ -1,0 +1,41 @@
+[city]
+name = "Sim City"
+hex_radius = 5        # km — size of each individual hex
+sim_duration_days = 1460
+tick_duration_min = 1
+sim_type = "Police"
+
+# Each district owns a list of hex cells (axial coords)
+# Station is placed at one specific hex within the district
+[[districts]]
+id = 0
+name = "Downtown"
+station_hex = { col = 0, row = 0 }   # which hex the station sits in
+hexes = [
+    { col = 0, row = 0 },
+    { col = 1, row = 0 },
+    { col = 0, row = 1 },
+]
+units = { police = 3 }
+
+[[districts]]
+id = 1
+name = "Eastside"
+station_hex = { col = 2, row = 0 }
+hexes = [
+    { col = 2, row = 0 },
+    { col = 3, row = 0 },
+    { col = 2, row = -1 },
+]
+units = { police = 4 }
+
+[[districts]]
+id = 2
+name = "Northgate"
+station_hex = { col = 1, row = 2 }
+hexes = [
+    { col = 0, row = 2 },
+    { col = 1, row = 2 },
+    { col = 1, row = 1 },
+]
+units = { police = 1 }
