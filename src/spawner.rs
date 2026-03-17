@@ -9,7 +9,7 @@ use rand_distr::{Distribution, Poisson};
 
 
 pub struct SpawnProfile {
-    id: SpawnProfileId,
+    //id: SpawnProfileId,
     pub base_lambda: f64,
     pub hour_multiplier: [f64; 24],
     pub weekday_multiplier: [f64; 7],
@@ -46,10 +46,18 @@ impl SpawnProfile {
         let poisson = Poisson::new(lambda).expect("lambda must be > 0");
         let count: u64 = poisson.sample(&mut rng) as u64;
 
+        
         (0..count)
-            .map(|_| {
+        .map(|i| {
+                let s = format!(
+                    "{}-{}-{}-{}",
+                    district_id.value(),
+                    node_id.value(),
+                    time_context.current_time.as_minutes(),
+                    i
+                );
                 Incident::new(
-                    IncidentId { 0 : 0 },
+                    IncidentId::new(s.clone()),
                     Priority::A,
                     node_id,
                     district_id,
@@ -60,45 +68,78 @@ impl SpawnProfile {
             .collect()
     }
 
-    pub fn urban(id: SpawnProfileId) -> Self {
-        Self {
-            id,
-            // ~3 incidents/hour baseline for a busy urban district
-            base_lambda: 3.0,
-
-            // 24h multipliers — low at night, morning spike, big evening peak
-            hour_multiplier: [
-                0.4, 0.3, 0.3, 0.3, 0.4, 0.6,  // 00–05 late night / early morning
-                0.8, 1.0, 1.2, 1.2, 1.1, 1.1,  // 06–11 morning ramp
-                1.2, 1.2, 1.1, 1.1, 1.3, 1.5,  // 12–17 afternoon
-                1.8, 2.0, 1.8, 1.5, 1.0, 0.6,  // 18–23 evening peak
-            ],
-
-            // Mon–Sun: weekdays steady, weekend nights spike
-            weekday_multiplier: [
-                1.0,  // Mon
-                1.0,  // Tue
-                1.0,  // Wed
-                1.1,  // Thu — start of weekend creep
-                1.3,  // Fri
-                1.5,  // Sat
-                1.2,  // Sun
-            ],
-
-            // Spring / Summer / Autumn / Winter
-            season_multiplier: [
-                1.1,  // Spring — more outdoor activity
-                1.3,  // Summer — peak (heat, tourism, events)
-                1.0,  // Autumn — baseline
-                0.8,  // Winter — people stay indoors, fewer incidents
-            ],
-
-            incident_weights: vec![
-                (IncidentKind::MedicalEmergency, 0.40),  // always the majority
-                (IncidentKind::Crime,            0.25),
-                (IncidentKind::Accident,         0.20),
-                (IncidentKind::Fire,             0.10),
-            ],
+    pub fn new(
+        base_lambda: f64,
+        hour_multiplier: [f64; 24],
+        weekday_multiplier: [f64; 7],
+        season_multiplier: [f64; 4],
+        incident_weights: Vec<(IncidentKind, f64)>,
+    ) -> Self {
+        SpawnProfile {
+            base_lambda,
+            hour_multiplier,
+            weekday_multiplier,
+            season_multiplier,
+            incident_weights,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_spawn() {
+     
+        let profile = test_spawn_profile_with_lambda(30.0);
+        let district_id = DistrictId::new(1);
+        let time_context = &TimeContext { hour: 12, day: 5, season: crate::types::Season::Autumn, current_time: SimTime(100) };
+        
+        let mut incidents: Vec<Incident> = Vec::new();
+        
+        
+        let node_id = NodeId::new(1);
+        incidents.extend(profile.spawn(time_context, node_id, district_id));
+        
+        assert!(!incidents.is_empty());
+    }
+
+    #[test]
+    fn spawn_returns_empty_when_lambda_zero() {
+        let profile = test_spawn_profile_with_lambda(0.0);
+        let district_id = DistrictId::new(1);
+        let node_id = NodeId::new(1);
+        let time_context = &TimeContext { hour: 12, day: 5, season: crate::types::Season::Autumn, current_time: SimTime(100) };
+
+        let incidents = profile.spawn(time_context, node_id, district_id);
+
+        assert!(incidents.is_empty());
+    }
+
+    #[test]
+    fn lambda_at_test() {
+        let profile = test_spawn_profile_with_lambda(0.05);
+        let time_context = &TimeContext { hour: 20, day: 6, season: crate::types::Season::Spring, current_time: SimTime(100) };
+        let lambda = profile.lambda_at(time_context);
+
+        assert!(lambda > 0.001);
+    }
+
+    fn test_spawn_profile_with_lambda(lambda: f64) -> SpawnProfile {
+        //residential
+        let hour_multiplier    = [0.4, 0.3, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0, 1.1, 1.2, 1.3, 1.3, 1.2, 1.0, 0.8, 0.5];
+        let weekday_multiplier = [1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.3];
+        let season_multiplier  = [1.0, 1.1, 1.0, 0.9];
+
+        let test_profile = SpawnProfile::new(
+            lambda,                     
+            hour_multiplier,
+            weekday_multiplier,
+            season_multiplier,              
+            vec![(IncidentKind::Crime, 1.0)], 
+        );
+
+        return test_profile
     }
 }

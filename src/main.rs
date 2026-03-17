@@ -1,29 +1,101 @@
-mod types;
-mod clock;
-mod event_log;
-mod city;
-mod district;
-mod unit;
-mod incident;
-mod config;
-mod spawner;
-mod routing;
-mod hex;
-mod station;
+// main.rs
 
-use crate::city::City;
-use crate::config::CityConfig;
-use crate::routing::build_travel_matrix;
+mod city;
+mod clock;
+mod config;
+mod district;
+mod event_log;
+mod hex;
+mod incident;
+mod routing;
+mod spawner;
+mod station;
+mod types;
+mod unit;
+
+use std::path::Path;
+use std::process;
+use std::time::Instant;
+
+use config::LoadedConfig;
+use city::City;
 
 fn main() {
-    let toml_str = std::fs::read_to_string("config/city.toml").unwrap();
-    let config: CityConfig = toml::from_str(&toml_str).unwrap();
+    let config_path = resolve_config_path();
 
-    let travel_matrix = build_travel_matrix(
-        &config.districts,
-        config.city.hex_radius,
+    println!("Loading config from: {}", config_path.display());
+
+    let cfg = LoadedConfig::load(&config_path).unwrap_or_else(|e| {
+        eprintln!("error: {}", e);
+        process::exit(1);
+    });
+
+    println!(
+        "Config loaded — sim_type: {:?}, districts: {}, duration: {} min",
+        cfg.city.sim.sim_type,
+        cfg.city.districts.len(),
+        cfg.city.sim.duration_minutes,
     );
 
-    let mut city = City::from_config(config, travel_matrix);
-    city.run(100);
+    let city = City::from_config(&cfg);
+
+    println!(
+        "City ready — {} districts, {} total units",
+        city.districts.len(),
+        city.districts.iter().map(|d| d.units.len()).sum::<usize>(),
+    );
+
+    run(city, &cfg);
+}
+
+// ---------------------------------------------------------------------------
+// Sim loop
+// ---------------------------------------------------------------------------
+
+fn run(mut city: City, cfg: &LoadedConfig) {
+    let total_ticks = cfg.city.sim.duration_minutes / cfg.city.sim.tick_minutes as u64;
+    let log_every = 10_000; // print progress every N ticks
+
+    println!("Starting sim — {} ticks total", total_ticks);
+    let now = Instant::now();
+
+    for tick in 0..total_ticks {
+        city.tick();
+
+        if tick % log_every == 0 {
+            println!(
+                "  tick {:>10} / {} — sim time: day {}, {:02}:{:02}",
+                tick,
+                total_ticks,
+                city.clock.elapsed_min / 1440,
+                city.clock.hour_of_day(),
+                city.clock.elapsed_min % 60,
+            );
+        }
+    }
+    let time = now.elapsed().as_millis() as i32;
+    println!("Sim complete in: {}.", time);
+}
+
+// ---------------------------------------------------------------------------
+// Config path resolution
+// ---------------------------------------------------------------------------
+
+/// Checks CLI args first, falls back to the default location.
+fn resolve_config_path() -> std::path::PathBuf {
+    let args: Vec<String> = std::env::args().collect();
+
+    if let Some(path) = args.get(1) {
+        return std::path::PathBuf::from(path);
+    }
+
+    // Default: look for config/city.toml next to the binary.
+    let default = Path::new("config/city.toml");
+    if default.exists() {
+        return default.to_path_buf();
+    }
+
+    eprintln!("error: no config path provided and config/city.toml not found");
+    eprintln!("usage: dispatch_sim [path/to/city.toml]");
+    process::exit(1);
 }

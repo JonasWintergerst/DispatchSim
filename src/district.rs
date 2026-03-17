@@ -1,8 +1,8 @@
 
 use crate::clock::{SimClock, SimTime, TimeContext};
-use crate::event_log::Event;
+use crate::event_log::{Event, EventKind};
 use crate::incident::Incident;
-use crate::types::{DistrictId, DistrictMsg, EventKind, IncidentStatus, NodeId, SpawnProfileId, StationId, StationName, UnitStatus};
+use crate::types::{DistrictId, DistrictMsg, IncidentStatus, NodeId, Priority, SpawnProfileId, StationId, StationName, UnitStatus};
 use crate::routing::RoadGraph;
 use crate::hex::Hex;
 use crate::station::Station;
@@ -19,10 +19,10 @@ use std::collections::HashMap;
 pub struct District {
     id: DistrictId,
     station: Station,
-    units: Vec<Unit>,
+    pub units: Vec<Unit>,
     incidents: Vec<Incident>,
     local_graph: RoadGraph,
-    hexes: Vec<Hex>,
+    pub hexes: Vec<Hex>,
     inbox: Vec<DistrictMsg>,
     outbox: Vec<DistrictMsg>,
 }
@@ -39,18 +39,24 @@ impl District {
         // Assign Units
         for incident in self.incidents.iter_mut() {
             if incident.get_status() == IncidentStatus::Open {
-                let start: NodeId = self.units[0].get_position(); //TODO get units position
-                let route = create_route(start, incident.location);
-                Self::dispatch(&mut self.units[0], &incident, route);
-                events.push(Event {
-                    sim_time: time_context.current_time.as_minutes(),
-                    kind: EventKind::AssignedUnit,
-                    district: self.id,
-                    unit: Some(self.units[0].id),
-                    incident: Some(incident.get_id()),
-                });
+
+                if let Some(unit) = self.units.iter_mut()
+                    .find(|u| u.status == UnitStatus::Idle)
+                {
+                    let route = create_route(unit.get_position(), incident.location);
+                    Self::dispatch(unit, &incident, route);
+                    events.push(Event {
+                        sim_time: time_context.current_time.as_minutes(),
+                        kind: EventKind::UnitDispatched,
+                        district: self.id,
+                        unit: Some(self.units[0].id),
+                        incident: Some(incident.get_id()),
+                    });
+                }
             }
         }
+
+        self.advance_routes();
 
         return events
     }
@@ -70,7 +76,7 @@ impl District {
             for i in new_incidents.iter() {
                 events.push(Event {
                     sim_time: time_context.current_time.as_minutes(),
-                    kind: EventKind::SpawnedIncident,
+                    kind: EventKind::IncidentSpawned,
                     district: self.id,
                     unit: None,
                     incident: Some(i.get_id()),
@@ -87,7 +93,7 @@ impl District {
     fn is_available(unit: &Unit) -> bool { return unit.get_status() == UnitStatus::Idle }
 
     fn dispatch(unit: &mut Unit, incident: &Incident, route: Vec<NodeId>) { 
-        unit.assign(incident.get_id());
+        unit.assign(incident.get_id().clone());
         unit.route = route;
         unit.status = UnitStatus::Dispatched;
     }
@@ -101,15 +107,13 @@ impl District {
     }
 
 
-    pub fn from_config(d: &DistrictConfig, hex_radius: f64) -> Self {
-        let station = Station::from_config(StationId(d.id));
-
+    pub fn new(district_id: DistrictId, station: Station, units: Vec<Unit>, hexes: Vec<Hex>) -> Self {
         District {
-            id: DistrictId(d.id),
-            hexes: Vec::new(),
+            id: district_id,
+            hexes: hexes,
             station,
             local_graph: RoadGraph::new(),
-            units: Vec::new(),
+            units: units,
             incidents: Vec::new(),
             inbox: Vec::new(),
             outbox: Vec::new(),

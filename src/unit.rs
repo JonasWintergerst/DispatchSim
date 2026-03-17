@@ -1,11 +1,11 @@
 
 
-use crate::types::{UnitStatus, UnitId, SimeType, IncidentId, NodeId};
+use crate::types::{UnitStatus, UnitId, SimType, IncidentId, NodeId};
 
 
 pub struct Unit {
     pub id: UnitId,
-    unit_type: SimeType, // Fire/Police/Ambulance
+    unit_type: SimType, // Fire/Police/Ambulance
     pub status: UnitStatus,
     position: NodeId,
     pub route: Vec<NodeId>,
@@ -13,7 +13,7 @@ pub struct Unit {
 }
 
 impl Unit {
-    pub fn new(id: UnitId, unit_type: SimeType, position: NodeId) -> Self {
+    pub fn new(id: UnitId, unit_type: SimType, position: NodeId) -> Self {
         Self {
             id,
             unit_type,

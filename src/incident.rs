@@ -7,7 +7,7 @@ use crate::clock::SimTime;
 pub struct Incident {
     id: IncidentId,
     kind: IncidentKind, //Fire/MedicalEmergency/Crime/Accident/...
-    priority: Priority,
+    pub priority: Priority,
     pub location: NodeId,
     district: DistrictId,
     unit_required: UnitRequirements,
@@ -44,5 +44,8 @@ impl Incident {
     }
     pub fn needs_more_units(&self) -> bool { true }
     pub fn get_status(&self) -> IncidentStatus { self.status }
-    pub fn get_id(&self) -> IncidentId { self.id }
+    pub fn get_id(&self) -> IncidentId { 
+
+        self.id.clone()
+    }
 }

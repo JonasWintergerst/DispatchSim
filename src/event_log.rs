@@ -1,13 +1,17 @@
 use serde::{Serialize, Deserialize};
+use rusqlite::{Connection, Result, params};
 
-use crate::types::{EventKind, DistrictId, UnitId, IncidentId};
+use crate::types::{DistrictId, UnitId, IncidentId};
 
-
-#[derive(Serialize, Deserialize)]
-pub struct EventLog;
-
-
-
+#[derive(Serialize, Deserialize, Debug)]
+pub enum EventKind {
+    IncidentSpawned,
+    UnitDispatched,
+    UnitArrived,
+    IncidentResolved,
+    MutualAidRequested,
+    UnitReturning,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Event {
@@ -18,21 +22,75 @@ pub struct Event {
     pub incident: Option<IncidentId>,
 }
 
-impl EventLog {
-    pub fn new() -> Self { EventLog }
-    pub fn init() {}
-    pub fn insert_batch(&self, events: &[Event]) {}
 
-    pub fn print_events(events: Vec<Event>) {
-        for event in events.iter() {
-            println!(
-                "Event {{ sim_time: {}, kind: {:?}, district: {:?}, unit: {:?}, incident: {:?} }}",
-                event.sim_time,
-                event.kind,
-                event.district,
-                event.unit,
-                event.incident
-            );
+impl EventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::IncidentSpawned   => "IncidentSpawned",
+            EventKind::UnitDispatched    => "UnitDispatched",
+            EventKind::UnitArrived       => "UnitArrived",
+            EventKind::IncidentResolved  => "IncidentResolved",
+            EventKind::MutualAidRequested => "MutualAidRequested",
+            EventKind::UnitReturning     => "UnitReturning",
         }
     }
 }
+
+
+pub struct EventLog{
+    conn: Connection,
+}
+
+impl EventLog {
+    /// Open (or create) the database file and set up the schema.
+    pub fn open(path: &str) -> Result<Self> {
+        let conn = Connection::open(path)?;
+
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                sim_time    INTEGER NOT NULL,
+                kind        TEXT    NOT NULL,
+                district    INTEGER NOT NULL,
+                unit        INTEGER,
+                incident    INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_sim_time  ON events (sim_time);
+            CREATE INDEX IF NOT EXISTS idx_district  ON events (district);
+            CREATE INDEX IF NOT EXISTS idx_kind      ON events (kind);
+        ")?;
+
+        Ok(Self { conn })
+    }
+
+    /// Flush a batch of events in a single transaction — call this after
+    /// every parallel tick, not inside District::tick() itself.
+    pub fn insert_batch(&mut self, events: &[Event]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO events (sim_time, kind, district, unit, incident)
+                 VALUES (?1, ?2, ?3, ?4, ?5)"
+            )?;
+
+            for e in events {
+                stmt.execute(params![
+                    e.sim_time as i64,
+                    e.kind.as_str(),
+                    e.district.value(),               // unwrap newtype
+                    e.unit.as_ref().map(|u| u.value()),
+                    e.incident.as_ref().map(|i| i.value()),
+                ])?;
+            }
+        }
+
+        tx.commit()
+    }
+}
+
+
+

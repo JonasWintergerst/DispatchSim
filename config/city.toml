@@ -1,41 +1,147 @@
-[city]
-name = "Sim City"
-hex_radius = 5        # km — size of each individual hex
-sim_duration_days = 1460
-tick_duration_min = 1
-sim_type = "Police"
+# city.toml
 
-# Each district owns a list of hex cells (axial coords)
-# Station is placed at one specific hex within the district
-[[districts]]
-id = 0
-name = "Downtown"
-station_hex = { col = 0, row = 0 }   # which hex the station sits in
-hexes = [
-    { col = 0, row = 0 },
-    { col = 1, row = 0 },
-    { col = 0, row = 1 },
-]
-units = { police = 3 }
+hex_grid_path = "config/hexes.json"
+
+[sim]
+tick_minutes     = 1
+duration_minutes = 2_102_400   # 4 years
+rng_seed         = 42
+sim_type         = "Police"   # Fire | Police | Medical — all units inherit this
+
+# ---------------------------------------------------------------------------
+# Districts + stations
+# IDs must match district_id values in hexes.json
+# ---------------------------------------------------------------------------
 
 [[districts]]
-id = 1
-name = "Eastside"
-station_hex = { col = 2, row = 0 }
-hexes = [
-    { col = 2, row = 0 },
-    { col = 3, row = 0 },
-    { col = 2, row = -1 },
-]
-units = { police = 4 }
+id   = 0
+name = "Northwest"
+
+[districts.station]
+id         = 0
+name       = "Station Northwest"
+unit_count = 3
 
 [[districts]]
-id = 2
-name = "Northgate"
-station_hex = { col = 1, row = 2 }
-hexes = [
-    { col = 0, row = 2 },
-    { col = 1, row = 2 },
-    { col = 1, row = 1 },
-]
-units = { police = 1 }
+id   = 1
+name = "North Central"
+
+[districts.station]
+id         = 1
+name       = "Station North Central"
+unit_count = 3
+
+[[districts]]
+id   = 2
+name = "Northeast"
+
+[districts.station]
+id         = 2
+name       = "Station Northeast"
+unit_count = 3
+
+[[districts]]
+id   = 3
+name = "Southwest"
+
+[districts.station]
+id         = 3
+name       = "Station Southwest"
+unit_count = 3
+
+[[districts]]
+id   = 4
+name = "Central"
+
+[districts.station]
+id         = 4
+name       = "Station Central"
+unit_count = 5
+
+[[districts]]
+id   = 5
+name = "Southeast"
+
+[districts.station]
+id         = 5
+name       = "Station Southeast"
+unit_count = 3
+
+[[districts]]
+id   = 6
+name = "South Central"
+
+[districts.station]
+id         = 6
+name       = "Station South Central"
+unit_count = 3
+
+# ---------------------------------------------------------------------------
+# Spawn profiles
+# ---------------------------------------------------------------------------
+
+[spawn_profiles.residential]
+base_lambda        = 0.05
+hour_multiplier    = [0.4, 0.3, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0, 1.1, 1.2, 1.3, 1.3, 1.2, 1.0, 0.8, 0.5]
+weekday_multiplier = [1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.3]
+season_multiplier  = [1.0, 1.1, 1.0, 0.9]
+
+[[spawn_profiles.residential.incident_weights]]
+kind   = "MedicalEmergency"
+weight = 0.40
+
+[[spawn_profiles.residential.incident_weights]]
+kind   = "Crime"
+weight = 0.25
+
+[[spawn_profiles.residential.incident_weights]]
+kind   = "Fire"
+weight = 0.20
+
+[[spawn_profiles.residential.incident_weights]]
+kind   = "Accident"
+weight = 0.15
+
+[spawn_profiles.commercial]
+base_lambda        = 0.12
+hour_multiplier    = [0.2, 0.1, 0.1, 0.1, 0.2, 0.5, 0.9, 1.3, 1.5, 1.5, 1.5, 1.5, 1.4, 1.5, 1.5, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.9, 0.7, 0.4]
+weekday_multiplier = [1.2, 1.2, 1.2, 1.2, 1.2, 0.9, 0.8]
+season_multiplier  = [1.0, 1.2, 1.0, 0.8]
+
+[[spawn_profiles.commercial.incident_weights]]
+kind   = "MedicalEmergency"
+weight = 0.35
+
+[[spawn_profiles.commercial.incident_weights]]
+kind   = "Accident"
+weight = 0.30
+
+[[spawn_profiles.commercial.incident_weights]]
+kind   = "Crime"
+weight = 0.20
+
+[[spawn_profiles.commercial.incident_weights]]
+kind   = "Fire"
+weight = 0.15
+
+[spawn_profiles.mixed]
+base_lambda        = 0.08
+hour_multiplier    = [0.3, 0.2, 0.2, 0.2, 0.3, 0.6, 0.9, 1.1, 1.2, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.1, 0.9, 0.7, 0.5]
+weekday_multiplier = [1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.0]
+season_multiplier  = [1.0, 1.1, 1.0, 0.9]
+
+[[spawn_profiles.mixed.incident_weights]]
+kind   = "MedicalEmergency"
+weight = 0.38
+
+[[spawn_profiles.mixed.incident_weights]]
+kind   = "Accident"
+weight = 0.25
+
+[[spawn_profiles.mixed.incident_weights]]
+kind   = "Crime"
+weight = 0.22
+
+[[spawn_profiles.mixed.incident_weights]]
+kind   = "Fire"
+weight = 0.15

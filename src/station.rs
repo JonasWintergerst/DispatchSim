@@ -1,19 +1,27 @@
-use crate::types::{ NodeId, StationId, StationName, SimeType, UnitId };
+use crate::types::{ NodeId, StationId, StationName, SimType, UnitId };
 
 pub struct Station {
     pub id: StationId,
     pub name: StationName,
-    pub station_type: SimeType,
+    pub station_type: SimType,
+    pub location: NodeId,
     pub home_unit_ids: Vec<UnitId>,
 }
 
 impl Station {
-    pub fn from_config(id: StationId ) -> Self {
+    pub fn new(
+        id: StationId,
+        name: String,
+        station_type: SimType,
+        location: NodeId,
+        home_unit_ids: Vec<UnitId>,
+    ) -> Self {
         Station { 
             id,
-            name: StationName{ 0: "test".to_string()},
-            station_type: SimeType::Police, 
-            home_unit_ids: Vec::new(),
+            name: StationName::new(name),
+            station_type, 
+            location,
+            home_unit_ids,
         }
     }
 }
