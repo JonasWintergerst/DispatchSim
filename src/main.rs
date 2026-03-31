@@ -12,6 +12,7 @@ mod spawner;
 mod station;
 mod types;
 mod unit;
+mod event_queue;
 
 use std::path::Path;
 use std::process;
@@ -53,28 +54,38 @@ fn main() {
 // ---------------------------------------------------------------------------
 
 fn run(mut city: City, cfg: &LoadedConfig) {
-    let total_ticks = cfg.city.sim.duration_minutes / cfg.city.sim.tick_minutes as u64;
-    let log_every = 10_000; // print progress every N ticks
+    let sim_end = cfg.city.sim.duration_minutes;
+    let log_every = 10_000;
 
-    println!("Starting sim — {} ticks total", total_ticks);
+    // Upper bound for progress — actual iterations will be far fewer
+    println!("Starting sim — {} min simulated time", sim_end);
     let now = Instant::now();
 
-    for tick in 0..total_ticks {
+    let mut tick = 0u64;
+    loop {
+        // Stop when heap is empty or clock has passed sim end
+        if city.event_heap.is_empty() || city.clock.elapsed_min >= sim_end {
+            break;
+        }
+
         city.tick();
+        tick += 1;
 
         if tick % log_every == 0 {
             println!(
-                "  tick {:>10} / {} — sim time: day {}, {:02}:{:02}",
+                "  event {:>10} — sim time: day {}, {:02}:{:02}",
                 tick,
-                total_ticks,
                 city.clock.elapsed_min / 1440,
                 city.clock.hour_of_day(),
                 city.clock.elapsed_min % 60,
             );
         }
     }
+
+    city.flush();
+
     let time = now.elapsed().as_millis() as i32;
-    println!("Sim complete in: {}.", time);
+    println!("Sim complete in: {}ms — {} events processed.", time, tick);
 }
 
 // ---------------------------------------------------------------------------

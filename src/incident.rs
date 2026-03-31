@@ -1,51 +1,52 @@
-
-
-use crate::types::{DistrictId, IncidentId, IncidentKind, IncidentStatus, NodeId, Priority, UnitId, UnitRequirements};
 use crate::clock::SimTime;
-
+use crate::types::{
+    DistrictId, IncidentId, IncidentKind, IncidentStatus, NodeId, Priority, UnitId,
+    UnitRequirements,
+};
 
 pub struct Incident {
-    id: IncidentId,
-    kind: IncidentKind, //Fire/MedicalEmergency/Crime/Accident/...
+    pub id: IncidentId,
+    pub kind: IncidentKind,
     pub priority: Priority,
     pub location: NodeId,
-    district: DistrictId,
-    unit_required: UnitRequirements,
-    spawned_at: SimTime,
-    resolved_at: Option<SimTime>,
-    units_assigned: Vec<UnitId>,
-    status: IncidentStatus,
+    pub district: DistrictId,
+    pub unit_required: UnitRequirements,
+    pub spawned_at: SimTime,
+    pub resolved_at: Option<SimTime>,
+    pub units_assigned: Vec<UnitId>,
+    pub status: IncidentStatus,
 }
 
 impl Incident {
     pub fn new(
-        id: IncidentId, 
-        priority: Priority, 
-        location: NodeId, 
-        district: DistrictId, 
+        id: IncidentId,
+        kind: IncidentKind,
+        priority: Priority,
+        location: NodeId,
+        district: DistrictId,
         unit_required: UnitRequirements,
-        spawned_at: SimTime) -> Self {
-            Self { 
-                id, 
-                kind: IncidentKind::Crime, 
-                priority, 
-                location, 
-                district, 
-                unit_required, 
-                spawned_at, 
-                resolved_at: None, 
-                units_assigned: vec![], 
-                status: IncidentStatus::Open }
+        spawned_at: SimTime,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            priority,
+            location,
+            district,
+            unit_required,
+            spawned_at,
+            resolved_at: None,
+            units_assigned: vec![],
+            status: IncidentStatus::Open,
         }
+    }
 
-    pub fn is_resolved(&self) -> bool { true }
     pub fn resolve(&mut self, time: SimTime) {
         self.resolved_at = Some(time);
+        self.status = IncidentStatus::Resolved;
     }
-    pub fn needs_more_units(&self) -> bool { true }
-    pub fn get_status(&self) -> IncidentStatus { self.status }
-    pub fn get_id(&self) -> IncidentId { 
 
-        self.id.clone()
+    pub fn is_resolved(&self) -> bool {
+        self.resolved_at.is_some()
     }
 }

@@ -1,15 +1,12 @@
-use crate::clock::{SimTime, TimeContext, SimClock};
-use crate::types::{IncidentId, IncidentKind, NodeId, Priority, SpawnProfileId, UnitRequirements, DistrictId};
-use crate::incident::Incident;
+use std::collections::HashMap;
 
 use rand::Rng;
-use rand::rngs::SmallRng;
-use rand::SeedableRng;
-use rand_distr::{Distribution, Poisson};
+use rand_distr::{Distribution, Exp};
 
+use crate::clock::SimTime;
+use crate::types::{IncidentKind, SpawnProfileId};
 
 pub struct SpawnProfile {
-    //id: SpawnProfileId,
     pub base_lambda: f64,
     pub hour_multiplier: [f64; 24],
     pub weekday_multiplier: [f64; 7],
@@ -18,56 +15,6 @@ pub struct SpawnProfile {
 }
 
 impl SpawnProfile {
-    /// Compute the effective λ (incidents per minute) at the given clock state.
-    /// base_lambda is per-hour, so we divide by 60 to get per-minute for Poisson draw.
-    pub fn lambda_at(&self, time_context: &TimeContext) -> f64 {
-
-        let season_idx = time_context.season as usize;
-
-        let effective_lambda = self.base_lambda
-            * self.hour_multiplier[time_context.hour as usize]
-            * self.weekday_multiplier[time_context.day as usize]
-            * self.season_multiplier[season_idx];
-
-        // Convert from per-hour → per-minute for the tick Poisson draw
-        effective_lambda / 60.0
-    }
-
-    /// Draw from Poisson(λ) to get incident count, then build each Incident.
-    pub fn spawn(&self, time_context: &TimeContext, node_id: NodeId, district_id: DistrictId) -> Vec<Incident> {
-        let mut rng = SmallRng::seed_from_u64(1);
-        let lambda = self.lambda_at(time_context);
-
-        // Guard: Poisson requires λ > 0
-        if lambda <= 0.0 {
-            return vec![];
-        }
-
-        let poisson = Poisson::new(lambda).expect("lambda must be > 0");
-        let count: u64 = poisson.sample(&mut rng) as u64;
-
-        
-        (0..count)
-        .map(|i| {
-                let s = format!(
-                    "{}-{}-{}-{}",
-                    district_id.value(),
-                    node_id.value(),
-                    time_context.current_time.as_minutes(),
-                    i
-                );
-                Incident::new(
-                    IncidentId::new(s.clone()),
-                    Priority::A,
-                    node_id,
-                    district_id,
-                    UnitRequirements { 0 : 1 },
-                    time_context.current_time,
-                )
-            })
-            .collect()
-    }
-
     pub fn new(
         base_lambda: f64,
         hour_multiplier: [f64; 24],
@@ -75,71 +22,59 @@ impl SpawnProfile {
         season_multiplier: [f64; 4],
         incident_weights: Vec<(IncidentKind, f64)>,
     ) -> Self {
-        SpawnProfile {
-            base_lambda,
-            hour_multiplier,
-            weekday_multiplier,
-            season_multiplier,
-            incident_weights,
-        }
+        SpawnProfile { base_lambda, hour_multiplier, weekday_multiplier, season_multiplier, incident_weights }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Sample the time of the next incident spawn for a given spawn profile.
+///
+/// Uses an Exponential inter-arrival process whose rate (λ) is recomputed at
+/// each hour boundary, so that time-of-day multipliers are applied correctly
+/// even when the sampled gap straddles midnight or another hour change.
+pub fn next_spawn_time(
+    from: SimTime,
+    profile_id: &SpawnProfileId,
+    profiles: &HashMap<SpawnProfileId, SpawnProfile>,
+    rng: &mut impl Rng,
+) -> SimTime {
+    let profile   = &profiles[profile_id];
+    let lambda    = effective_lambda(from, profile);
+    let candidate = from.0 + sample_inter_arrival(lambda, rng);
+    let boundary  = next_hour_boundary(from);
 
-    #[test]
-    fn test_spawn() {
-     
-        let profile = test_spawn_profile_with_lambda(30.0);
-        let district_id = DistrictId::new(1);
-        let time_context = &TimeContext { hour: 12, day: 5, season: crate::types::Season::Autumn, current_time: SimTime(100) };
-        
-        let mut incidents: Vec<Incident> = Vec::new();
-        
-        
-        let node_id = NodeId::new(1);
-        incidents.extend(profile.spawn(time_context, node_id, district_id));
-        
-        assert!(!incidents.is_empty());
+    if candidate < boundary.0 {
+        SimTime(candidate)
+    } else {
+        // Recalculate with the next hour's λ after crossing the boundary.
+        next_spawn_time(boundary, profile_id, profiles, rng)
     }
+}
 
-    #[test]
-    fn spawn_returns_empty_when_lambda_zero() {
-        let profile = test_spawn_profile_with_lambda(0.0);
-        let district_id = DistrictId::new(1);
-        let node_id = NodeId::new(1);
-        let time_context = &TimeContext { hour: 12, day: 5, season: crate::types::Season::Autumn, current_time: SimTime(100) };
+/// Sample an inter-arrival duration in whole minutes from Exp(λ).
+/// `lambda_per_hour` is converted to per-minute before sampling.
+pub fn sample_inter_arrival(lambda_per_hour: f64, rng: &mut impl Rng) -> u64 {
+    let lambda_per_min = lambda_per_hour / 60.0;
+    let exp     = Exp::new(lambda_per_min).expect("lambda must be > 0");
+    let minutes = exp.sample(rng);
+    minutes.round().max(1.0) as u64
+}
 
-        let incidents = profile.spawn(time_context, node_id, district_id);
+// ---------------------------------------------------------------------------
+// Internals
+// ---------------------------------------------------------------------------
 
-        assert!(incidents.is_empty());
-    }
+fn effective_lambda(time: SimTime, profile: &SpawnProfile) -> f64 {
+    let hour   = (time.0 / 60 % 24) as usize;
+    let day    = (time.0 / 1440 % 7) as usize;
+    let season = (time.0 / 1440 % 365 / 91).min(3) as usize;
 
-    #[test]
-    fn lambda_at_test() {
-        let profile = test_spawn_profile_with_lambda(0.05);
-        let time_context = &TimeContext { hour: 20, day: 6, season: crate::types::Season::Spring, current_time: SimTime(100) };
-        let lambda = profile.lambda_at(time_context);
+    profile.base_lambda
+        * profile.hour_multiplier[hour]
+        * profile.weekday_multiplier[day]
+        * profile.season_multiplier[season]
+}
 
-        assert!(lambda > 0.001);
-    }
-
-    fn test_spawn_profile_with_lambda(lambda: f64) -> SpawnProfile {
-        //residential
-        let hour_multiplier    = [0.4, 0.3, 0.3, 0.3, 0.4, 0.6, 0.8, 1.0, 1.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0, 1.1, 1.2, 1.3, 1.3, 1.2, 1.0, 0.8, 0.5];
-        let weekday_multiplier = [1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.3];
-        let season_multiplier  = [1.0, 1.1, 1.0, 0.9];
-
-        let test_profile = SpawnProfile::new(
-            lambda,                     
-            hour_multiplier,
-            weekday_multiplier,
-            season_multiplier,              
-            vec![(IncidentKind::Crime, 1.0)], 
-        );
-
-        return test_profile
-    }
+fn next_hour_boundary(from: SimTime) -> SimTime {
+    let mins_into_hour = from.0 % 60;
+    SimTime(from.0 + (60 - mins_into_hour))
 }
