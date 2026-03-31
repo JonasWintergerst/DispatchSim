@@ -31,6 +31,7 @@ pub enum UnitStatus {
     Idle,
     Dispatched,
     OnScene,
+    Returning,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -53,6 +54,13 @@ pub enum Priority {
     A,
     B,
     C,
+}
+
+impl Priority {
+    /// Numeric rank for comparison: A=2 (highest), B=1, C=0 (lowest).
+    pub fn rank(self) -> u8 {
+        match self { Priority::A => 2, Priority::B => 1, Priority::C => 0 }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

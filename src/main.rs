@@ -5,14 +5,15 @@ mod clock;
 mod config;
 mod district;
 mod event_log;
+mod event_queue;
 mod hex;
 mod incident;
+mod report;
 mod routing;
 mod spawner;
 mod station;
 mod types;
 mod unit;
-mod event_queue;
 
 use std::path::Path;
 use std::process;
@@ -22,6 +23,17 @@ use config::LoadedConfig;
 use city::City;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).map(String::as_str) == Some("report") {
+        let db_path = args.get(2).map(String::as_str).unwrap_or("./output/dispatch_sim.db");
+        report::print_report(db_path).unwrap_or_else(|e| {
+            eprintln!("error reading database: {}", e);
+            process::exit(1);
+        });
+        return;
+    }
+
     let config_path = resolve_config_path();
 
     println!("Loading config from: {}", config_path.display());
@@ -94,9 +106,7 @@ fn run(mut city: City, cfg: &LoadedConfig) {
 
 /// Checks CLI args first, falls back to the default location.
 fn resolve_config_path() -> std::path::PathBuf {
-    let args: Vec<String> = std::env::args().collect();
-
-    if let Some(path) = args.get(1) {
+    if let Some(path) = std::env::args().nth(1) {
         return std::path::PathBuf::from(path);
     }
 

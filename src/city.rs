@@ -164,13 +164,29 @@ impl City {
         // 4. Travel matrix from hex geometry.
         let travel_matrix = TravelMatrix::from_districts(&districts);
 
-        // 5. Seed one IncidentSpawn per hex at time 0.
-        //    Each spawn handler will immediately schedule the next one.
+        // 5. Seed one ShiftChange per district starting at t=0 (shift 1 begins).
+        //    Each handler reschedules the next shift automatically.
         let mut event_heap: BinaryHeap<Reverse<SimEvent>> = BinaryHeap::new();
         for district in &districts {
+            event_heap.push(Reverse(SimEvent::ShiftChange {
+                time:        SimTime(0),
+                district_id: district.id,
+            }));
+        }
+
+        // 6. Seed one IncidentSpawn per hex, staggered by drawing the first
+        //    inter-arrival time from the spawn profile. This avoids an
+        //    artificial burst of events at t=0.
+        for district in &districts {
             for hex in &district.hexes {
+                let first_time = crate::spawner::next_spawn_time(
+                    SimTime(0),
+                    &hex.spawn_profile_id,
+                    &profiles,
+                    &mut seed_rng,
+                );
                 event_heap.push(Reverse(SimEvent::IncidentSpawn {
-                    time:        SimTime(0),
+                    time:        first_time,
                     hex_id:      hex.id,
                     district_id: district.id,
                 }));

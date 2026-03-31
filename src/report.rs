@@ -1,0 +1,284 @@
+// report.rs
+// Queries dispatch_sim.db and prints a post-run analysis report to stdout.
+// Invoked via:  dispatch_sim report [path/to/dispatch_sim.db]
+
+use rusqlite::{Connection, Result};
+
+pub fn print_report(db_path: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+
+    // Ensure the incident index exists on databases created before this was added.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_incident ON events (incident);"
+    )?;
+
+    println!("\n=== dispatch_sim Analysis Report ===");
+    println!("Database: {}\n", db_path);
+
+    print_overview(&conn)?;
+    print_response_times(&conn)?;
+    print_on_scene_duration(&conn)?;
+    print_utilization(&conn)?;
+    print_hourly_incidents(&conn)?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Overview
+// ---------------------------------------------------------------------------
+
+fn print_overview(conn: &Connection) -> Result<()> {
+    let total_events: i64 =
+        conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+
+    let sim_duration: Option<i64> =
+        conn.query_row("SELECT MAX(sim_time) FROM events", [], |r| r.get(0))?;
+
+    let spawned: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'IncidentSpawned'",
+        [], |r| r.get(0),
+    )?;
+
+    let resolved: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'IncidentResolved'",
+        [], |r| r.get(0),
+    )?;
+
+    let duration_min = sim_duration.unwrap_or(0);
+    let duration_yr  = duration_min as f64 / (60.0 * 24.0 * 365.0);
+
+    println!("Simulation");
+    println!("  Duration:      {:>12} min  ({:.2} yr)", fmt_int(duration_min), duration_yr);
+    println!("  Events logged: {:>12}", fmt_int(total_events));
+
+    let open    = spawned - resolved;
+    let open_pct = if spawned > 0 { open as f64 / spawned as f64 * 100.0 } else { 0.0 };
+    println!("\nIncidents");
+    println!("  Spawned:       {:>12}", fmt_int(spawned));
+    println!("  Resolved:      {:>12}", fmt_int(resolved));
+    println!("  Open / queued: {:>12}  ({:.1}% unresolved)", fmt_int(open), open_pct);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Response times (spawn → unit arrival)
+// ---------------------------------------------------------------------------
+
+fn print_response_times(conn: &Connection) -> Result<()> {
+    // Load (district, response_minutes) for all resolved incidents.
+    let mut stmt = conn.prepare(
+        "SELECT a.district, (a.sim_time - s.sim_time) AS response_min
+         FROM events s
+         JOIN events a ON s.incident = a.incident
+         WHERE s.kind = 'IncidentSpawned' AND a.kind = 'UnitArrived'
+         ORDER BY a.district",
+    )?;
+
+    let rows: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        println!("\nResponse Times — no data");
+        return Ok(());
+    }
+
+    println!("\nResponse Time  (spawn → unit arrival, minutes)");
+    println!("  {:<10} {:>8} {:>8} {:>8} {:>8} {:>8}",
+             "District", "N", "Avg", "P50", "P95", "Max");
+
+    let mut by_district: std::collections::BTreeMap<i64, Vec<i64>> = std::collections::BTreeMap::new();
+    for (district, rt) in &rows {
+        by_district.entry(*district).or_default().push(*rt);
+    }
+
+    for (district, mut times) in by_district {
+        times.sort_unstable();
+        let n   = times.len();
+        let avg = times.iter().sum::<i64>() as f64 / n as f64;
+        let p50 = times[n / 2];
+        let p95 = times[(n as f64 * 0.95) as usize];
+        let max = times[n - 1];
+        println!("  {:<10} {:>8} {:>8.1} {:>8} {:>8} {:>8}",
+                 district, n, avg, p50, p95, max);
+    }
+
+    // City-wide totals
+    let mut all: Vec<i64> = rows.iter().map(|(_, rt)| *rt).collect();
+    all.sort_unstable();
+    let n   = all.len();
+    let avg = all.iter().sum::<i64>() as f64 / n as f64;
+    let p50 = all[n / 2];
+    let p95 = all[(n as f64 * 0.95) as usize];
+    let max = all[n - 1];
+    println!("  {:<10} {:>8} {:>8.1} {:>8} {:>8} {:>8}",
+             "ALL", n, avg, p50, p95, max);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// On-scene duration (unit arrival → resolved)
+// ---------------------------------------------------------------------------
+
+fn print_on_scene_duration(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT (r.sim_time - a.sim_time) AS scene_min
+         FROM events a
+         JOIN events r ON a.incident = r.incident
+         WHERE a.kind = 'UnitArrived' AND r.kind = 'IncidentResolved'",
+    )?;
+
+    let mut times: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if times.is_empty() {
+        println!("\nOn-Scene Duration — no data");
+        return Ok(());
+    }
+
+    times.sort_unstable();
+    let n   = times.len();
+    let avg = times.iter().sum::<i64>() as f64 / n as f64;
+    let p50 = times[n / 2];
+    let p95 = times[(n as f64 * 0.95) as usize];
+    let max = times[n - 1];
+
+    println!("\nOn-Scene Duration  (unit arrival → resolved, minutes)");
+    println!("  {:<8} {:>8} {:>8} {:>8} {:>8}",
+             "N", "Avg", "P50", "P95", "Max");
+    println!("  {:<8} {:>8.1} {:>8} {:>8} {:>8}",
+             n, avg, p50, p95, max);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Unit utilization
+// ---------------------------------------------------------------------------
+
+fn print_utilization(conn: &Connection) -> Result<()> {
+    // busy_minutes per unit = sum of (IncidentResolved.sim_time - UnitDispatched.sim_time)
+    // for matching incident IDs, grouped by unit.
+    let mut stmt = conn.prepare(
+        "SELECT d.district, d.unit, SUM(r.sim_time - d.sim_time) AS busy_min
+         FROM events d
+         JOIN events r ON d.incident = r.incident
+         WHERE d.kind = 'UnitDispatched' AND r.kind = 'IncidentResolved'
+           AND d.unit IS NOT NULL
+         GROUP BY d.district, d.unit
+         ORDER BY d.district, d.unit",
+    )?;
+
+    let rows: Vec<(i64, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let sim_duration: Option<i64> =
+        conn.query_row("SELECT MAX(sim_time) FROM events", [], |r| r.get(0))?;
+
+    let duration = sim_duration.unwrap_or(1).max(1);
+
+    if rows.is_empty() {
+        println!("\nUnit Utilization — no data");
+        return Ok(());
+    }
+
+    println!("\nUnit Utilization  (busy time / sim duration)");
+    println!("  {:<10} {:>6} {:>10} {:>10} {:>10}",
+             "District", "Units", "Avg Busy%", "Min Busy%", "Max Busy%");
+
+    let mut by_district: std::collections::BTreeMap<i64, Vec<f64>> = std::collections::BTreeMap::new();
+    for (district, _unit, busy_min) in &rows {
+        let pct = *busy_min as f64 / duration as f64 * 100.0;
+        by_district.entry(*district).or_default().push(pct);
+    }
+
+    let mut total_pcts: Vec<f64> = Vec::new();
+    for (district, pcts) in &by_district {
+        let n   = pcts.len();
+        let avg = pcts.iter().sum::<f64>() / n as f64;
+        let min = pcts.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = pcts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        total_pcts.extend(pcts);
+        println!("  {:<10} {:>6} {:>10.1} {:>10.1} {:>10.1}",
+                 district, n, avg, min, max);
+    }
+
+    let n   = total_pcts.len();
+    let avg = total_pcts.iter().sum::<f64>() / n as f64;
+    let min = total_pcts.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = total_pcts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    println!("  {:<10} {:>6} {:>10.1} {:>10.1} {:>10.1}",
+             "ALL", n, avg, min, max);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Incidents per hour of day
+// ---------------------------------------------------------------------------
+
+fn print_hourly_incidents(conn: &Connection) -> Result<()> {
+    // Count spawns per hour of day across the full simulation.
+    // Divide by the number of full days simulated to get a per-day rate.
+    let mut stmt = conn.prepare(
+        "SELECT (sim_time / 60) % 24 AS hour, COUNT(*) AS n
+         FROM events
+         WHERE kind = 'IncidentSpawned'
+         GROUP BY hour
+         ORDER BY hour",
+    )?;
+
+    let hourly: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if hourly.is_empty() {
+        println!("\nHourly Distribution — no data");
+        return Ok(());
+    }
+
+    let sim_duration: Option<i64> =
+        conn.query_row("SELECT MAX(sim_time) FROM events", [], |r| r.get(0))?;
+
+    let days = (sim_duration.unwrap_or(0) as f64 / 1440.0).max(1.0);
+
+    println!("\nIncidents by Hour of Day  (avg per simulated day)");
+    println!("  {:<6} {:>8} {:>8}", "Hour", "Total", "Per Day");
+
+    let mut counts = [0i64; 24];
+    for (hour, n) in &hourly {
+        if *hour >= 0 && *hour < 24 {
+            counts[*hour as usize] = *n;
+        }
+    }
+
+    for (hour, count) in counts.iter().enumerate() {
+        let per_day = *count as f64 / days;
+        println!("  {:02}:00  {:>8} {:>8.1}", hour, fmt_int(*count), per_day);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+fn fmt_int(n: i64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 { result.push(','); }
+        result.push(ch);
+    }
+    result.chars().rev().collect()
+}

@@ -11,6 +11,8 @@ pub enum EventKind {
     IncidentResolved,
     MutualAidRequested,
     UnitReturning,
+    UnitReturned,
+    ShiftStarted,
 }
 
 impl EventKind {
@@ -22,6 +24,8 @@ impl EventKind {
             EventKind::IncidentResolved   => "IncidentResolved",
             EventKind::MutualAidRequested => "MutualAidRequested",
             EventKind::UnitReturning      => "UnitReturning",
+            EventKind::UnitReturned       => "UnitReturned",
+            EventKind::ShiftStarted       => "ShiftStarted",
         }
     }
 }
@@ -60,6 +64,7 @@ impl EventLog {
             CREATE INDEX IF NOT EXISTS idx_sim_time ON events (sim_time);
             CREATE INDEX IF NOT EXISTS idx_district ON events (district);
             CREATE INDEX IF NOT EXISTS idx_kind     ON events (kind);
+            CREATE INDEX IF NOT EXISTS idx_incident ON events (incident);
         ")?;
 
         Ok(Self { conn })

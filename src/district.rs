@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use rand::RngExt;
 use rand::rngs::SmallRng;
@@ -12,10 +12,13 @@ use crate::routing::{RoadGraph, TravelMatrix};
 use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
-    DistrictId, HexId, IncidentId, IncidentKind, Priority, SpawnProfileId, UnitId,
+    DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, Priority, SpawnProfileId, UnitId,
     UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
+
+/// Simulated minutes per shift (8 hours).
+const SHIFT_MINUTES: u64 = 480;
 
 pub struct District {
     pub id: DistrictId,
@@ -23,8 +26,10 @@ pub struct District {
     pub units: Vec<Unit>,
     pub hexes: Vec<Hex>,
     incidents: Vec<Incident>,
-    pending_queue: VecDeque<IncidentId>,
-    road_graph: RoadGraph,  // Phase 2: populated from OSM data
+    /// Incidents waiting for a unit, stored in arbitrary order.
+    /// `pop_best_pending` selects by priority so insertion order doesn't matter.
+    pending_queue: Vec<IncidentId>,
+    road_graph: RoadGraph, // Phase 2: populated from OSM data
     incident_counter: u32,
     rng: SmallRng,
 }
@@ -37,7 +42,7 @@ impl District {
             units,
             hexes,
             incidents: Vec::new(),
-            pending_queue: VecDeque::new(),
+            pending_queue: Vec::new(),
             road_graph: RoadGraph::new(),
             incident_counter: 0,
             rng,
@@ -57,14 +62,17 @@ impl District {
                 SimEvent::IncidentSpawn { time, hex_id, .. } => {
                     self.handle_spawn(*time, *hex_id, profiles, travel, &mut out);
                 }
-                SimEvent::UnitArrival { time, unit_id, incident_id, .. } => {
-                    self.handle_arrival(*time, *unit_id, incident_id, &mut out);
+                SimEvent::UnitArrival { time, unit_id, incident_id, dispatch_id, .. } => {
+                    self.handle_arrival(*time, *unit_id, incident_id, *dispatch_id, &mut out);
                 }
                 SimEvent::IncidentResolve { time, incident_id, .. } => {
                     self.handle_resolve(*time, incident_id, travel, &mut out);
                 }
-                SimEvent::UnitReturn { unit_id, .. } => {
-                    self.handle_return(*unit_id);
+                SimEvent::UnitReturn { time, unit_id, dispatch_id, .. } => {
+                    self.handle_return(*time, *unit_id, *dispatch_id, travel, &mut out);
+                }
+                SimEvent::ShiftChange { time, .. } => {
+                    self.handle_shift_change(*time, &mut out);
                 }
                 SimEvent::NoOp => {}
             }
@@ -83,7 +91,6 @@ impl District {
         travel: &TravelMatrix,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
-        // Extract all hex data before any mutable borrow.
         let (location, spawn_profile_id) = self
             .hexes
             .iter()
@@ -94,60 +101,55 @@ impl District {
         let profile  = &profiles[&spawn_profile_id];
         let kind     = sample_incident_kind(&profile.incident_weights, &mut self.rng);
         let priority = sample_priority(&mut self.rng);
+        let new_rank = priority.rank();
 
         let incident_id = IncidentId::new(format!("{}-{}", self.id.value(), self.incident_counter));
         self.incident_counter += 1;
 
-        let incident = Incident::new(
-            incident_id.clone(),
-            kind,
-            priority,
-            location,
-            self.id,
-            UnitRequirements(1),
-            time,
-        );
-        self.incidents.push(incident);
+        self.incidents.push(Incident::new(
+            incident_id.clone(), kind, priority, location, self.id, UnitRequirements(1), time,
+        ));
 
-        // Dispatch the first idle unit, or queue the incident if none available.
-        if let Some(unit) = self.units.iter_mut().find(|u| u.status == UnitStatus::Idle) {
-            let route        = travel.route_between(unit.position(), location);
-            let travel_time  = travel.travel_time(unit.position(), location);
-            let arrival_time = SimTime(time.0 + travel_time as u64);
+        // Find a unit to dispatch: idle → returning → preempt lowest-priority dispatched.
+        let dispatch_idx =
+            if let Some(idx) = self.units.iter().position(|u| u.status == UnitStatus::Idle) {
+                Some(idx)
+            } else if let Some(idx) = self.units.iter().position(|u| u.status == UnitStatus::Returning) {
+                Some(idx)
+            } else if let Some((idx, old_id)) = self.find_preemptable(new_rank) {
+                // Return the preempted incident to the pending queue.
+                if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == old_id) {
+                    inc.status = IncidentStatus::Open;
+                }
+                self.pending_queue.push(old_id);
+                Some(idx)
+            } else {
+                None
+            };
 
-            unit.dispatch(route, time, arrival_time, incident_id.clone());
+        if let Some(idx) = dispatch_idx {
+            let from        = self.units[idx].position();
+            let route       = travel.route_between(from, location);
+            let tt          = travel.travel_time(from, location) as u64;
+            let arrival     = SimTime(time.0 + tt);
+            let unit_id     = self.units[idx].id;
+            let dispatch_id = self.units[idx].dispatch(route, time, arrival, incident_id.clone());
 
+            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == incident_id) {
+                inc.status = IncidentStatus::Assigned;
+            }
             out.push((
-                SimEvent::UnitArrival {
-                    time: arrival_time,
-                    unit_id: unit.id,
-                    incident_id: incident_id.clone(),
-                    district_id: self.id,
-                },
-                Event {
-                    sim_time: time.0,
-                    kind: EventKind::UnitDispatched,
-                    district: self.id,
-                    unit: Some(unit.id),
-                    incident: Some(incident_id.clone()),
-                },
+                SimEvent::UnitArrival { time: arrival, unit_id, incident_id: incident_id.clone(), district_id: self.id, dispatch_id },
+                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()) },
             ));
         } else {
-            // No idle unit — hold the incident until one frees up.
-            self.pending_queue.push_back(incident_id.clone());
+            self.pending_queue.push(incident_id.clone());
         }
 
-        // Schedule the next spawn for this hex.
         let next = next_spawn_time(time, &spawn_profile_id, profiles, &mut self.rng);
         out.push((
             SimEvent::IncidentSpawn { time: next, hex_id, district_id: self.id },
-            Event {
-                sim_time: time.0,
-                kind: EventKind::IncidentSpawned,
-                district: self.id,
-                unit: None,
-                incident: Some(incident_id),
-            },
+            Event { sim_time: time.0, kind: EventKind::IncidentSpawned, district: self.id, unit: None, incident: Some(incident_id) },
         ));
     }
 
@@ -156,37 +158,37 @@ impl District {
         time: SimTime,
         unit_id: UnitId,
         incident_id: &IncidentId,
+        dispatch_id: u32,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
-        // Look up incident location before the mutable units borrow.
-        let incident_location = self.incidents
-            .iter()
-            .find(|i| i.id == *incident_id)
-            .map(|i| i.location);
+        let Some(idx) = self.units.iter().position(|u| u.id == unit_id) else { return; };
 
-        if let Some(unit) = self.units.iter_mut().find(|u| u.id == unit_id) {
-            match incident_location {
-                Some(loc) => unit.arrive(loc),
-                None      => unit.status = UnitStatus::OnScene,
-            }
+        // Discard if the unit was reassigned after this event was scheduled.
+        if self.units[idx].dispatch_id != dispatch_id { return; }
+
+        let (incident_location, priority) = self.incidents.iter()
+            .find(|i| i.id == *incident_id)
+            .map(|i| (Some(i.location), Some(i.priority)))
+            .unwrap_or((None, None));
+        match incident_location {
+            Some(loc) => self.units[idx].arrive(loc),
+            None      => self.units[idx].status = UnitStatus::OnScene,
         }
 
-        let resolve_duration = self.rng.random_range(15u64..=90);
+        // On-scene duration by priority — Larson (1972), Chaiken (1978):
+        //   P1 (immediate): mean ≈ 70 min  →  Uniform(45, 90)
+        //   P2 (urgent):    mean ≈ 40 min  →  Uniform(25, 55)
+        //   P3 (routine):   mean ≈ 25 min  →  Uniform(15, 35)
+        let resolve_duration = match priority {
+            Some(Priority::A) => self.rng.random_range(45u64..=90),
+            Some(Priority::B) => self.rng.random_range(25u64..=55),
+            _                 => self.rng.random_range(15u64..=35),
+        };
         let resolve_time     = SimTime(time.0 + resolve_duration);
 
         out.push((
-            SimEvent::IncidentResolve {
-                time: resolve_time,
-                incident_id: incident_id.clone(),
-                district_id: self.id,
-            },
-            Event {
-                sim_time: time.0,
-                kind: EventKind::UnitArrived,
-                district: self.id,
-                unit: Some(unit_id),
-                incident: Some(incident_id.clone()),
-            },
+            SimEvent::IncidentResolve { time: resolve_time, incident_id: incident_id.clone(), district_id: self.id },
+            Event { sim_time: time.0, kind: EventKind::UnitArrived, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()) },
         ));
     }
 
@@ -197,101 +199,140 @@ impl District {
         travel: &TravelMatrix,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
-        // Step 1: resolve the incident.
         if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == *incident_id) {
             inc.resolve(time);
         }
 
-        // Step 2: free the assigned unit; extract id and current position.
-        let freed = self.units.iter_mut()
-            .find(|u| u.assigned_incident.as_ref() == Some(incident_id))
-            .map(|u| {
-                let id  = u.id;
-                let pos = u.position();
-                u.status            = UnitStatus::Idle;
-                u.assigned_incident = None;
-                (id, pos)
-            });
+        let Some(unit_idx) = self.units.iter().position(|u| u.assigned_incident.as_ref() == Some(incident_id)) else {
+            out.push((SimEvent::NoOp, Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: None, incident: Some(incident_id.clone()) }));
+            return;
+        };
+        let unit_id = self.units[unit_idx].id;
 
         out.push((
             SimEvent::NoOp,
-            Event {
-                sim_time: time.0,
-                kind:     EventKind::IncidentResolved,
-                district: self.id,
-                unit:     freed.map(|(id, _)| id),
-                incident: Some(incident_id.clone()),
-            },
+            Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()) },
         ));
 
-        let (unit_id, unit_pos) = match freed {
-            Some(f) => f,
-            None    => return,
-        };
+        // Dispatch to a waiting incident before sending the unit home.
+        if let Some(pending_id) = self.pop_best_pending() {
+            let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
+            let from        = self.units[unit_idx].position();
+            let route       = travel.route_between(from, pending_loc);
+            let tt          = travel.travel_time(from, pending_loc) as u64;
+            let arrival     = SimTime(time.0 + tt);
+            let dispatch_id = self.units[unit_idx].dispatch(route, time, arrival, pending_id.clone());
 
-        let station_loc = self.station.location;
-
-        // Step 3: check the pending queue before sending the unit home.
-        if let Some(pending_id) = self.pending_queue.pop_front() {
-            // Find the pending incident's location. It should always exist and be unresolved.
-            if let Some(pending_loc) = self.incidents
-                .iter()
-                .find(|i| i.id == pending_id && !i.is_resolved())
-                .map(|i| i.location)
-            {
-                if let Some(unit) = self.units.iter_mut().find(|u| u.id == unit_id) {
-                    let route        = travel.route_between(unit.position(), pending_loc);
-                    let travel_time  = travel.travel_time(unit.position(), pending_loc) as u64;
-                    let arrival_time = SimTime(time.0 + travel_time);
-
-                    unit.dispatch(route, time, arrival_time, pending_id.clone());
-
-                    out.push((
-                        SimEvent::UnitArrival {
-                            time:        arrival_time,
-                            unit_id:     unit.id,
-                            incident_id: pending_id.clone(),
-                            district_id: self.id,
-                        },
-                        Event {
-                            sim_time: time.0,
-                            kind:     EventKind::UnitDispatched,
-                            district: self.id,
-                            unit:     Some(unit_id),
-                            incident: Some(pending_id),
-                        },
-                    ));
-                }
-                return;
+            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == pending_id) {
+                inc.status = IncidentStatus::Assigned;
             }
-            // Pending incident was already resolved (shouldn't happen in Phase 1) — fall through.
-        }
-
-        // Step 4: no pending incident — send unit back to station.
-        if unit_pos != station_loc {
-            let travel_time  = travel.travel_time(unit_pos, station_loc) as u64;
-            let return_time  = SimTime(time.0 + travel_time);
-
             out.push((
-                SimEvent::UnitReturn { time: return_time, unit_id, district_id: self.id },
-                Event {
-                    sim_time: time.0,
-                    kind:     EventKind::UnitReturning,
-                    district: self.id,
-                    unit:     Some(unit_id),
-                    incident: None,
-                },
+                SimEvent::UnitArrival { time: arrival, unit_id, incident_id: pending_id.clone(), district_id: self.id, dispatch_id },
+                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id) },
+            ));
+        } else {
+            // No pending work — return to station.
+            let unit_pos    = self.units[unit_idx].position();
+            let station_loc = self.station.location;
+            if unit_pos == station_loc {
+                self.units[unit_idx].status            = UnitStatus::Idle;
+                self.units[unit_idx].assigned_incident = None;
+            } else {
+                let dispatch_id = self.units[unit_idx].start_return();
+                let tt          = travel.travel_time(unit_pos, station_loc) as u64;
+                let return_time = SimTime(time.0 + tt);
+                out.push((
+                    SimEvent::UnitReturn { time: return_time, unit_id, district_id: self.id, dispatch_id },
+                    Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: None },
+                ));
+            }
+        }
+    }
+
+    fn handle_return(
+        &mut self,
+        time: SimTime,
+        unit_id: UnitId,
+        dispatch_id: u32,
+        travel: &TravelMatrix,
+        out: &mut Vec<(SimEvent, Event)>,
+    ) {
+        let Some(idx) = self.units.iter().position(|u| u.id == unit_id) else { return; };
+
+        // Discard if the unit was reassigned while returning.
+        if self.units[idx].dispatch_id != dispatch_id { return; }
+
+        self.units[idx].return_to_station();
+        self.units[idx].status            = UnitStatus::Idle;
+        self.units[idx].assigned_incident = None;
+
+        out.push((
+            SimEvent::NoOp,
+            Event { sim_time: time.0, kind: EventKind::UnitReturned, district: self.id, unit: Some(unit_id), incident: None },
+        ));
+
+        // Immediately dispatch if something is waiting.
+        if let Some(pending_id) = self.pop_best_pending() {
+            let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
+            let from        = self.units[idx].position();
+            let route       = travel.route_between(from, pending_loc);
+            let tt          = travel.travel_time(from, pending_loc) as u64;
+            let arrival     = SimTime(time.0 + tt);
+            let did         = self.units[idx].dispatch(route, time, arrival, pending_id.clone());
+
+            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == pending_id) {
+                inc.status = IncidentStatus::Assigned;
+            }
+            out.push((
+                SimEvent::UnitArrival { time: arrival, unit_id, incident_id: pending_id.clone(), district_id: self.id, dispatch_id: did },
+                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id) },
             ));
         }
     }
 
-    fn handle_return(&mut self, unit_id: UnitId) {
-        if let Some(unit) = self.units.iter_mut().find(|u| u.id == unit_id) {
-            // Only update position if the unit has not been re-dispatched while in transit.
-            if unit.status == UnitStatus::Idle && unit.assigned_incident.is_none() {
-                unit.return_to_station();
-            }
-        }
+    fn handle_shift_change(&mut self, time: SimTime, out: &mut Vec<(SimEvent, Event)>) {
+        // Log the shift boundary and schedule the next one.
+        // Future: rotate on/off-duty crew here.
+        out.push((
+            SimEvent::ShiftChange { time: SimTime(time.0 + SHIFT_MINUTES), district_id: self.id },
+            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None },
+        ));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    /// Find a dispatched unit (if any) whose current incident has lower priority than
+    /// `new_rank`. Returns the index of the best preemption target (lowest priority)
+    /// and the incident id it was assigned to.
+    fn find_preemptable(&self, new_rank: u8) -> Option<(usize, IncidentId)> {
+        self.units.iter().enumerate()
+            .filter(|(_, u)| u.status == UnitStatus::Dispatched)
+            .filter_map(|(idx, u)| {
+                let assigned = u.assigned_incident.as_ref()?;
+                let rank = self.incidents.iter()
+                    .find(|i| i.id == *assigned)?
+                    .priority.rank();
+                if rank < new_rank { Some((idx, assigned.clone(), rank)) } else { None }
+            })
+            .min_by_key(|(_, _, rank)| *rank)
+            .map(|(idx, id, _)| (idx, id))
+    }
+
+    /// Remove and return the highest-priority incident from the pending queue.
+    fn pop_best_pending(&mut self) -> Option<IncidentId> {
+        // Collect (queue_index, priority_rank) for all non-resolved pending incidents.
+        let ranked: Vec<(usize, u8)> = self.pending_queue.iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                self.incidents.iter()
+                    .find(|inc| &inc.id == id && !inc.is_resolved())
+                    .map(|inc| (i, inc.priority.rank()))
+            })
+            .collect();
+
+        let best_i = ranked.into_iter().max_by_key(|(_, r)| *r).map(|(i, _)| i)?;
+        // swap_remove is O(1) and order doesn't matter since we always pick by priority.
+        Some(self.pending_queue.swap_remove(best_i))
     }
 }
 
@@ -310,9 +351,10 @@ fn sample_incident_kind(weights: &[(IncidentKind, f64)], rng: &mut impl RngExt) 
 }
 
 fn sample_priority(rng: &mut impl RngExt) -> Priority {
-    match rng.random_range(0u32..3) {
-        0 => Priority::A,
-        1 => Priority::B,
-        _ => Priority::C,
+    // P1=15%, P2=35%, P3=50% — APCO Project 33 / BJS LEMAS empirical mix
+    match rng.random_range(0u32..100) {
+        0..15  => Priority::A,
+        15..50 => Priority::B,
+        _      => Priority::C,
     }
 }

@@ -46,9 +46,25 @@ The simulation outputs a SQLite database to `./output/dispatch_sim.db`.
 
 ### Event Processing Flow (per district)
 
-- **IncidentSpawn** → create `Incident`, find nearest idle `Unit`, call `TravelMatrix::route_between`, dispatch unit, emit `UnitArrival` at `now + travel_time`, schedule next spawn via exponential draw
-- **UnitArrival** → set unit to `OnScene`, sample resolution duration, emit `IncidentResolve`
-- **IncidentResolve** → mark incident `Resolved`, free unit back to `Idle`, emit `NoOp`
+- **IncidentSpawn** → create `Incident`, find a unit to dispatch (idle → returning → preempt lower-priority dispatched), emit `UnitArrival`; if no unit available, push to `pending_queue`; schedule next spawn via exponential draw
+- **UnitArrival** → stale-check `dispatch_id`; if valid, set unit to `OnScene`, sample resolution duration, emit `IncidentResolve`
+- **IncidentResolve** → mark incident `Resolved`; check `pending_queue` for waiting incidents — if found, dispatch unit directly from scene; otherwise emit `UnitReturn` and set unit to `Returning`
+- **UnitReturn** → stale-check `dispatch_id`; if valid, move unit to home station, set `Idle`; check `pending_queue` and dispatch immediately if something is waiting
+- **ShiftChange** → log shift boundary, reschedule next `ShiftChange` at `now + 480 min`; hook for future crew-rotation logic
+
+### Dispatch Priority & Preemption
+
+Units are assigned using this precedence on every `IncidentSpawn`:
+1. **Idle** unit — dispatched immediately
+2. **Returning** unit — redirected en route back to station
+3. **Preemption** — if new incident has higher priority than any currently-dispatched unit's incident, that unit is redirected; the preempted incident returns to `pending_queue`
+4. **Queue** — incident added to `pending_queue` if no unit is available
+
+`pending_queue` is a `Vec<IncidentId>`; `pop_best_pending()` always selects the highest-priority (`A > B > C`) open incident regardless of arrival order.
+
+### Stale-Event Detection
+
+Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` or `start_return()` call. `UnitArrival` and `UnitReturn` events embed the `dispatch_id` at the time of scheduling. When these events fire, the handler compares the event's `dispatch_id` against the unit's current value — a mismatch means the unit was reassigned and the event is silently discarded. This avoids the need to remove events from the heap.
 
 ### Configuration
 
@@ -61,9 +77,11 @@ The simulation outputs a SQLite database to `./output/dispatch_sim.db`.
 - **Districts are the unit of parallelism** — each district processes its events independently; inter-district coordination (mutual aid) is stubbed via `DistrictMsg` inbox/outbox but not yet implemented
 - **`SimEvent` vs `Event`** — `SimEvent` drives future scheduling (heap); `Event` is an immutable log record written to SQLite
 
-### Known Phase 2 Gaps
+### Known Gaps / Planned Work
 
-- `routing.rs` returns direct-hop routes with zero intermediate nodes; will be replaced by OSM road graph + Dijkstra
-- Units do not return to station after `IncidentResolve` (TODO in code)
-- `rstar` (R-tree) and `ratatui` (TUI) are dependencies imported but unused — planned for spatial indexing and visualization respectively
-- Inter-district mutual aid dispatch is scaffolded but not wired up
+- `routing.rs` returns direct-hop routes with Chebyshev distance; will be replaced by OSM road graph + Dijkstra (petgraph already a dependency)
+- `ShiftChange` logs boundaries but does not yet rotate crews or change unit availability
+- Patrol routes are not yet modelled — open question on route generation and mid-patrol position
+- `rstar` (R-tree) and `ratatui` (TUI) are dependencies imported but unused — planned for spatial indexing and visualization
+- Inter-district mutual aid is scaffolded (`DistrictMsg` in `types.rs`) but not wired up
+- `TravelMatrix` is an O(N²) precomputed HashMap; acceptable for Phase 1 but will be replaced once routing is graph-based

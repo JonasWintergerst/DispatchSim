@@ -5,9 +5,12 @@ use crate::types::{DistrictId, HexId, IncidentId, UnitId};
 
 pub enum SimEvent {
     IncidentSpawn   { time: SimTime, hex_id: HexId, district_id: DistrictId },
-    UnitArrival     { time: SimTime, unit_id: UnitId, incident_id: IncidentId, district_id: DistrictId },
+    UnitArrival     { time: SimTime, unit_id: UnitId, incident_id: IncidentId, district_id: DistrictId, dispatch_id: u32 },
     IncidentResolve { time: SimTime, incident_id: IncidentId, district_id: DistrictId },
-    UnitReturn      { time: SimTime, unit_id: UnitId, district_id: DistrictId },
+    /// Unit has finished travelling and arrives at its home station.
+    UnitReturn      { time: SimTime, unit_id: UnitId, district_id: DistrictId, dispatch_id: u32 },
+    /// Periodic shift boundary — logs the change and schedules the next one.
+    ShiftChange     { time: SimTime, district_id: DistrictId },
     /// Sentinel for event handlers that have no follow-on simulation event.
     /// Filtered out in City::tick and never pushed to the heap.
     NoOp,
@@ -20,6 +23,7 @@ impl SimEvent {
             SimEvent::UnitArrival     { time, .. } => Some(*time),
             SimEvent::IncidentResolve { time, .. } => Some(*time),
             SimEvent::UnitReturn      { time, .. } => Some(*time),
+            SimEvent::ShiftChange     { time, .. } => Some(*time),
             SimEvent::NoOp            => None,
         }
     }
@@ -30,6 +34,7 @@ impl SimEvent {
             SimEvent::UnitArrival     { district_id, .. } => Some(*district_id),
             SimEvent::IncidentResolve { district_id, .. } => Some(*district_id),
             SimEvent::UnitReturn      { district_id, .. } => Some(*district_id),
+            SimEvent::ShiftChange     { district_id, .. } => Some(*district_id),
             SimEvent::NoOp            => None,
         }
     }

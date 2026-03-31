@@ -26,13 +26,21 @@ Tasks are grouped by phase. Phase 0 must be completed before the simulation will
 
 ## Phase 2 — Realism & Performance
 
-- [ ] **Graph-based routing** — replace the Chebyshev hex-distance stub in `routing.rs` (`create_route()` returns `[]`, `route_travel_time()` returns `0`) with a proper hex-adjacency graph + Dijkstra using `petgraph` (already a dependency).
+- [ ] **Phase 2a — OSM road graph + A\* routing** — replace `TravelMatrix` (Chebyshev hex-distance) in `routing.rs` with a real Hamburg road graph loaded from an OSM `.pbf` file (Geofabrik). Nodes = OSM intersections (`NodeId` becomes OSM node ID u64), edges = road segments with travel time (segment length / road type speed). Parse with `osmpbf` crate; build a `petgraph::DiGraph`; route with A\* using straight-line distance as heuristic. Add `OsmRoutingEngine` with lazy per-query route caching (`RwLock<HashMap>`). Keep the synthetic hex grid as spatial unit for now.
+- [ ] **Phase 2b — H3 spatial layer** — replace the synthetic `hexes.json` grid with H3 cells (`h3o` crate) over Hamburg at an appropriate resolution (~1 km cells = resolution 7–8). Each H3 cell gets a district ID and spawn profile. Each cell stores `nearest_road_node: NodeId` (snapped to nearest OSM intersection). Districts map to Hamburg Stadtteile polygons or custom bounding polygons loaded from GeoJSON.
 - [ ] **Nearest-unit spatial index** — replace the linear idle-unit scan in dispatch with an `rstar` R-tree (already a dependency, currently unused) for O(log n) nearest-idle-unit lookup. Also enables cross-district searches for mutual aid.
+- [ ] **Patrol routes for units** — define what a patrol route is (sequence of hex nodes) and how routes are assigned. Open questions: static per district or dynamic, how to model position mid-patrol at dispatch time. Likely approach: store route on unit state, compute position on-demand rather than via events.
 - [ ] **Wire up inter-district mutual aid** — `DistrictMsg` enum and inbox/outbox channels are scaffolded in `types.rs` and `district.rs` but never used. When a district has no idle units it should broadcast `RequestMutualAid`; neighboring districts respond with `SendUnit` if they have a spare.
+
+---
+
+## Phase 4 — Optimization Integration
+
+- [ ] **Programmatic config API** — expose a `SimConfig::builder()` or plain struct API so an outer optimizer can construct district layouts, unit counts, and spawn profiles without a TOML file. `City::from_config` stays for CLI use; add `City::from_sim_config(SimConfig)` as a second entry point that accepts the struct directly. Enables running the sim in a tight eval loop without file I/O.
 
 ---
 
 ## Phase 3 — Observability & Output
 
 - [ ] **ratatui TUI dashboard** — `ratatui` is already a dependency. Live terminal view showing: sim time, events/sec, per-district unit status (idle/dispatched/on-scene), incident queue depth, and a color-coded hex-grid map. Headless by default, toggled via CLI flag.
-- [ ] **Post-run analysis report** — add a CLI subcommand (or auto-print) that queries `dispatch_sim.db` for: average response time by district/type/priority, unit utilization rates, incidents-per-hour histogram, queue wait times. Validates that outputs are sensible.
+- [x] **Post-run analysis report** — `cargo run -- report [db_path]` queries `dispatch_sim.db` and prints: response time (avg/P50/P95/max) per district, on-scene duration, unit utilization %, and incidents per hour of day.
