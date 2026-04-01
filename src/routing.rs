@@ -1,18 +1,21 @@
-// Phase 1: travel times derived from hex grid Chebyshev distance.
-// Phase 2: replace TravelMatrix with per-district petgraph + Dijkstra;
-//          the travel_time / route_between interface stays the same.
+// Phase 2a: RoutingEngine replaces TravelMatrix.
+//   - Hex grid → petgraph DiGraph, 8-connected adjacency, weight 1 per hop.
+//   - All-pairs travel times precomputed at build time via Dijkstra.
+//   - route_between: lazy A* with RwLock cache (Sync for Rayon districts).
+// Phase 2b hook: from_graph() accepts any externally-built RoadGraph (e.g. OSM).
 
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use geo::Point;
-use petgraph::graph::Graph;
+use petgraph::algo::{astar, dijkstra};
+use petgraph::graph::{Graph, NodeIndex};
 
-use crate::district::District;
 use crate::hex::HexCoord;
 use crate::types::NodeId;
 
 // ---------------------------------------------------------------------------
-// Road graph (Phase 2 placeholder)
+// Road graph (import API for Phase 2b OSM)
 // ---------------------------------------------------------------------------
 
 pub struct Node {
@@ -27,55 +30,178 @@ pub struct Edge {
 pub type RoadGraph = Graph<Node, Edge>;
 
 // ---------------------------------------------------------------------------
-// Travel matrix (Phase 1)
+// Routing engine (Phase 2a)
 // ---------------------------------------------------------------------------
 
-/// Pairwise travel durations between all nodes in the city, keyed by (from, to).
-pub struct TravelMatrix {
-    times: HashMap<(NodeId, NodeId), u32>,
+pub struct RoutingEngine {
+    graph:      RoadGraph,
+    node_index: HashMap<NodeId, NodeIndex>,
+    /// Precomputed all-pairs travel times; O(1) lookup.
+    times:  HashMap<(NodeId, NodeId), u32>,
+    /// Lazily-populated route cache; RwLock makes RoutingEngine Sync for Rayon.
+    routes: RwLock<HashMap<(NodeId, NodeId), Vec<NodeId>>>,
 }
 
-impl TravelMatrix {
-    pub fn from_districts(districts: &[District]) -> Self {
-        let nodes: Vec<(NodeId, HexCoord)> = districts
-            .iter()
-            .flat_map(|d| d.hexes.iter().map(|h| (h.node_id(), h.coord())))
-            .collect();
+impl RoutingEngine {
+    /// Build from hex grid: every hex = one node, 8-connected adjacency, weight 1.
+    pub fn from_hex_grid(hexes: &[(NodeId, HexCoord)]) -> Self {
+        let mut graph = RoadGraph::new();
+        let mut node_index: HashMap<NodeId, NodeIndex> = HashMap::with_capacity(hexes.len());
+        let mut coord_index: HashMap<(i32, i32), NodeIndex> = HashMap::with_capacity(hexes.len());
 
-        let mut times = HashMap::new();
-        for &(id_a, coord_a) in &nodes {
-            for &(id_b, coord_b) in &nodes {
-                times.insert((id_a, id_b), travel_minutes(&coord_a, &coord_b));
+        for &(node_id, coord) in hexes {
+            let nx = graph.add_node(Node {
+                id:       node_id,
+                position: Point::new(coord.col as f64, coord.row as f64),
+            });
+            node_index.insert(node_id, nx);
+            coord_index.insert((coord.col, coord.row), nx);
+        }
+
+        const NEIGHBOURS: [(i32, i32); 8] = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        ];
+        for &(node_id, coord) in hexes {
+            let from_nx = node_index[&node_id];
+            for (dc, dr) in NEIGHBOURS {
+                if let Some(&to_nx) = coord_index.get(&(coord.col + dc, coord.row + dr)) {
+                    graph.add_edge(from_nx, to_nx, Edge { travel_time_min: 1 });
+                }
             }
         }
 
-        Self { times }
+        Self::build(graph, node_index)
     }
 
-    /// Travel time in simulated minutes between two nodes.
+    /// Build from an externally-constructed road graph (Phase 2b OSM import).
+    pub fn from_graph(graph: RoadGraph) -> Self {
+        let node_index: HashMap<NodeId, NodeIndex> = graph
+            .node_indices()
+            .map(|nx| (graph[nx].id, nx))
+            .collect();
+        Self::build(graph, node_index)
+    }
+
+    fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>) -> Self {
+        let mut times: HashMap<(NodeId, NodeId), u32> =
+            HashMap::with_capacity(node_index.len() * node_index.len());
+
+        for (&node_id, &nx) in &node_index {
+            let result = dijkstra(&graph, nx, None, |e| e.weight().travel_time_min);
+            for (&target_nx, &cost) in &result {
+                times.insert((node_id, graph[target_nx].id), cost);
+            }
+        }
+
+        Self { graph, node_index, times, routes: RwLock::new(HashMap::new()) }
+    }
+
+    pub fn contains_node(&self, id: NodeId) -> bool {
+        self.node_index.contains_key(&id)
+    }
+
+    /// Travel time in simulated minutes between two nodes. O(1) lookup.
     /// Returns 1 as a safe default if either node is unknown.
     pub fn travel_time(&self, from: NodeId, to: NodeId) -> u32 {
         self.times.get(&(from, to)).copied().unwrap_or(1)
     }
 
-    /// Phase 1: direct [from, to] hop.
-    /// Phase 2: replace with Dijkstra over the district's road graph.
+    /// Shortest path between two nodes; lazily computed and cached.
     pub fn route_between(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {
-        if from == to { vec![from] } else { vec![from, to] }
+        if from == to {
+            return vec![from];
+        }
+
+        {
+            let cache = self.routes.read().unwrap();
+            if let Some(route) = cache.get(&(from, to)) {
+                return route.clone();
+            }
+        }
+
+        let route = self.compute_route(from, to);
+        self.routes.write().unwrap().insert((from, to), route.clone());
+        route
+    }
+
+    fn compute_route(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {
+        let (Some(&from_nx), Some(&to_nx)) =
+            (self.node_index.get(&from), self.node_index.get(&to))
+        else {
+            return vec![from, to];
+        };
+
+        astar(
+            &self.graph,
+            from_nx,
+            |nx| nx == to_nx,
+            |e| e.weight().travel_time_min,
+            |_| 0u32,
+        )
+        .map(|(_, path)| path.iter().map(|&nx| self.graph[nx].id).collect())
+        .unwrap_or_else(|| vec![from, to])
     }
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Tests
 // ---------------------------------------------------------------------------
 
-/// Chebyshev distance between two hex cells scaled to simulated minutes.
-///
-/// At 50×50 hexes ≈ 25km × 25km city each hex is ~500m.
-/// At 30 km/h average urban speed that is roughly 1 minute per hex.
-fn travel_minutes(a: &HexCoord, b: &HexCoord) -> u32 {
-    const MINUTES_PER_HEX: u32 = 1;
-    let col_dist = (a.col - b.col).unsigned_abs();
-    let row_dist = (a.row - b.row).unsigned_abs();
-    (col_dist.max(row_dist) * MINUTES_PER_HEX).max(1)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_grid(cols: i32, rows: i32) -> Vec<(NodeId, HexCoord)> {
+        (0..cols)
+            .flat_map(|col| (0..rows).map(move |row| {
+                let coord = HexCoord::new(col, row);
+                (NodeId::from_hex(&coord), coord)
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn hex_grid_adjacent_cost_is_one() {
+        let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
+        let a = NodeId::from_hex(&HexCoord::new(1, 1));
+        let b = NodeId::from_hex(&HexCoord::new(2, 1));
+        assert_eq!(engine.travel_time(a, b), 1);
+    }
+
+    #[test]
+    fn hex_grid_diagonal_cost_is_one() {
+        let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
+        let a = NodeId::from_hex(&HexCoord::new(0, 0));
+        let b = NodeId::from_hex(&HexCoord::new(1, 1));
+        assert_eq!(engine.travel_time(a, b), 1);
+    }
+
+    #[test]
+    fn hex_grid_corner_to_corner_cost() {
+        // 3×3 grid: corners are 2 Chebyshev steps apart.
+        let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
+        let tl = NodeId::from_hex(&HexCoord::new(0, 0));
+        let br = NodeId::from_hex(&HexCoord::new(2, 2));
+        assert_eq!(engine.travel_time(tl, br), 2);
+    }
+
+    #[test]
+    fn route_between_valid_path() {
+        let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
+        let tl = NodeId::from_hex(&HexCoord::new(0, 0));
+        let br = NodeId::from_hex(&HexCoord::new(2, 2));
+        let route = engine.route_between(tl, br);
+        assert_eq!(route[0], tl);
+        assert_eq!(*route.last().unwrap(), br);
+        // Diagonal step: optimal path has 3 nodes (start, mid, end) or just 2 if direct diagonal
+        assert!(route.len() >= 2 && route.len() <= 3);
+    }
+
+    #[test]
+    fn route_between_same_node() {
+        let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
+        let a = NodeId::from_hex(&HexCoord::new(1, 1));
+        assert_eq!(engine.route_between(a, a), vec![a]);
+    }
 }

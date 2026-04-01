@@ -8,12 +8,13 @@ use crate::event_log::{Event, EventKind};
 use crate::event_queue::SimEvent;
 use crate::hex::Hex;
 use crate::incident::Incident;
-use crate::routing::{RoadGraph, TravelMatrix};
+use crate::hex::HexCoord;
+use crate::routing::RoutingEngine;
 use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
-    DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, Priority, SpawnProfileId, UnitId,
-    UnitRequirements, UnitStatus,
+    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, NodeId, Priority,
+    SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
 
@@ -21,31 +22,37 @@ use crate::unit::Unit;
 const SHIFT_MINUTES: u64 = 480;
 
 pub struct District {
-    pub id: DistrictId,
-    pub station: Station,
-    pub units: Vec<Unit>,
-    pub hexes: Vec<Hex>,
-    incidents: Vec<Incident>,
+    pub id:           DistrictId,
+    pub station:      Station,
+    pub units:        Vec<Unit>,
+    pub hexes:        Vec<Hex>,
+    /// Border hexes 8-adjacent to a different district; populated by City after construction.
+    pub border_nodes: Vec<BorderNode>,
+    incidents:        Vec<Incident>,
     /// Incidents waiting for a unit, stored in arbitrary order.
     /// `pop_best_pending` selects by priority so insertion order doesn't matter.
-    pending_queue: Vec<IncidentId>,
-    road_graph: RoadGraph, // Phase 2: populated from OSM data
+    pending_queue:    Vec<IncidentId>,
     incident_counter: u32,
-    rng: SmallRng,
+    rng:              SmallRng,
+    routing:          RoutingEngine,
 }
 
 impl District {
     pub fn new(id: DistrictId, station: Station, units: Vec<Unit>, hexes: Vec<Hex>, rng: SmallRng) -> Self {
+        let hex_pairs: Vec<(NodeId, HexCoord)> =
+            hexes.iter().map(|h| (h.node_id(), h.coord())).collect();
+        let routing = RoutingEngine::from_hex_grid(&hex_pairs);
         District {
             id,
             station,
             units,
             hexes,
+            border_nodes: Vec::new(),
             incidents: Vec::new(),
             pending_queue: Vec::new(),
-            road_graph: RoadGraph::new(),
             incident_counter: 0,
             rng,
+            routing,
         }
     }
 
@@ -53,23 +60,22 @@ impl District {
         &mut self,
         batch: &[SimEvent],
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
-        travel: &TravelMatrix,
     ) -> Vec<(SimEvent, Event)> {
         let mut out = Vec::new();
 
         for ev in batch {
             match ev {
                 SimEvent::IncidentSpawn { time, hex_id, .. } => {
-                    self.handle_spawn(*time, *hex_id, profiles, travel, &mut out);
+                    self.handle_spawn(*time, *hex_id, profiles, &mut out);
                 }
                 SimEvent::UnitArrival { time, unit_id, incident_id, dispatch_id, .. } => {
                     self.handle_arrival(*time, *unit_id, incident_id, *dispatch_id, &mut out);
                 }
                 SimEvent::IncidentResolve { time, incident_id, .. } => {
-                    self.handle_resolve(*time, incident_id, travel, &mut out);
+                    self.handle_resolve(*time, incident_id, &mut out);
                 }
                 SimEvent::UnitReturn { time, unit_id, dispatch_id, .. } => {
-                    self.handle_return(*time, *unit_id, *dispatch_id, travel, &mut out);
+                    self.handle_return(*time, *unit_id, *dispatch_id, &mut out);
                 }
                 SimEvent::ShiftChange { time, .. } => {
                     self.handle_shift_change(*time, &mut out);
@@ -88,7 +94,6 @@ impl District {
         time: SimTime,
         hex_id: HexId,
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
-        travel: &TravelMatrix,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
         let (location, spawn_profile_id) = self
@@ -129,8 +134,8 @@ impl District {
 
         if let Some(idx) = dispatch_idx {
             let from        = self.units[idx].position();
-            let route       = travel.route_between(from, location);
-            let tt          = travel.travel_time(from, location) as u64;
+            let route       = self.routing.route_between(from, location);
+            let tt          = self.routing.travel_time(from, location) as u64;
             let arrival     = SimTime(time.0 + tt);
             let unit_id     = self.units[idx].id;
             let dispatch_id = self.units[idx].dispatch(route, time, arrival, incident_id.clone());
@@ -196,7 +201,6 @@ impl District {
         &mut self,
         time: SimTime,
         incident_id: &IncidentId,
-        travel: &TravelMatrix,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
         if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == *incident_id) {
@@ -218,8 +222,8 @@ impl District {
         if let Some(pending_id) = self.pop_best_pending() {
             let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
             let from        = self.units[unit_idx].position();
-            let route       = travel.route_between(from, pending_loc);
-            let tt          = travel.travel_time(from, pending_loc) as u64;
+            let route       = self.routing.route_between(from, pending_loc);
+            let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
             let dispatch_id = self.units[unit_idx].dispatch(route, time, arrival, pending_id.clone());
 
@@ -239,7 +243,7 @@ impl District {
                 self.units[unit_idx].assigned_incident = None;
             } else {
                 let dispatch_id = self.units[unit_idx].start_return();
-                let tt          = travel.travel_time(unit_pos, station_loc) as u64;
+                let tt          = self.routing.travel_time(unit_pos, station_loc) as u64;
                 let return_time = SimTime(time.0 + tt);
                 out.push((
                     SimEvent::UnitReturn { time: return_time, unit_id, district_id: self.id, dispatch_id },
@@ -254,7 +258,6 @@ impl District {
         time: SimTime,
         unit_id: UnitId,
         dispatch_id: u32,
-        travel: &TravelMatrix,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
         let Some(idx) = self.units.iter().position(|u| u.id == unit_id) else { return; };
@@ -275,8 +278,8 @@ impl District {
         if let Some(pending_id) = self.pop_best_pending() {
             let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
             let from        = self.units[idx].position();
-            let route       = travel.route_between(from, pending_loc);
-            let tt          = travel.travel_time(from, pending_loc) as u64;
+            let route       = self.routing.route_between(from, pending_loc);
+            let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
             let did         = self.units[idx].dispatch(route, time, arrival, pending_id.clone());
 

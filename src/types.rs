@@ -96,7 +96,7 @@ impl IncidentId {
     pub fn value(&self) -> &str { &self.0 }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct NodeId(u32);
 impl NodeId {
     pub fn new(val: u32) -> Self { Self(val) }
@@ -135,3 +135,11 @@ impl StationId {
 /// Minimum number of units required to handle an incident.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct UnitRequirements(pub u8);
+
+/// A hex on a district's boundary that is 8-adjacent to a hex in a different district.
+/// Stored per district as the Phase 2 mutual-aid hook.
+#[derive(Debug, Clone, Copy)]
+pub struct BorderNode {
+    pub node_id:            NodeId,
+    pub neighbour_district: DistrictId,
+}

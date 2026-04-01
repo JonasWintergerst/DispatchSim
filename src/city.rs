@@ -12,10 +12,9 @@ use crate::district::District;
 use crate::event_log::{Event, EventLog};
 use crate::event_queue::SimEvent;
 use crate::hex::{Hex, HexCoord};
-use crate::routing::TravelMatrix;
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
-use crate::types::{DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId, UnitId};
+use crate::types::{BorderNode, DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId, UnitId};
 use crate::unit::Unit;
 
 /// Flush buffered log events to SQLite every this many simulated minutes (1 sim-day).
@@ -29,7 +28,6 @@ pub struct City {
     event_buffer:   Vec<Event>,
     next_flush:     u64,
     profiles:       HashMap<SpawnProfileId, SpawnProfile>,
-    travel_matrix:  TravelMatrix,
     sim_type:       SimType,
 }
 
@@ -54,14 +52,13 @@ impl City {
             // NoOp has no district — discard it
         }
 
-        let profiles      = &self.profiles;
-        let travel_matrix = &self.travel_matrix;
+        let profiles = &self.profiles;
 
         let follow_on: Vec<(SimEvent, Event)> = self.districts
             .par_iter_mut()
             .flat_map(|d| {
                 let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
-                d.process_events(batch, profiles, travel_matrix)
+                d.process_events(batch, profiles)
             })
             .collect();
 
@@ -116,7 +113,7 @@ impl City {
         let mut next_hex_id:  u32 = 0;
         let mut seed_rng = SmallRng::seed_from_u64(cfg.city.sim.rng_seed);
 
-        let districts: Vec<District> = cfg.city.districts.iter().map(|district_cfg| {
+        let mut districts: Vec<District> = cfg.city.districts.iter().map(|district_cfg| {
             let district_id = DistrictId::new(district_cfg.id);
 
             let hexes: Vec<Hex> = hexes_by_district
@@ -161,8 +158,37 @@ impl City {
             District::new(district_id, station, units, hexes, district_rng)
         }).collect();
 
-        // 4. Travel matrix from hex geometry.
-        let travel_matrix = TravelMatrix::from_districts(&districts);
+        // 4. Detect border nodes: hexes 8-adjacent to a hex in a different district.
+        //    Stored per district as the Phase 2 mutual-aid hook.
+        let mut coord_to_district: HashMap<(i32, i32), DistrictId> =
+            HashMap::with_capacity(cfg.hex_grid.hexes.len());
+        for d in &districts {
+            for h in &d.hexes {
+                coord_to_district.insert((h.coord().col, h.coord().row), d.id);
+            }
+        }
+
+        const NEIGHBOURS: [(i32, i32); 8] = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        ];
+
+        for d in &mut districts {
+            let mut borders: Vec<BorderNode> = Vec::new();
+            for h in &d.hexes {
+                let (c, r) = (h.coord().col, h.coord().row);
+                let mut seen: Vec<DistrictId> = Vec::new();
+                for (dc, dr) in NEIGHBOURS {
+                    if let Some(&fid) = coord_to_district.get(&(c + dc, r + dr)) {
+                        if fid != d.id && !seen.contains(&fid) {
+                            borders.push(BorderNode { node_id: h.node_id(), neighbour_district: fid });
+                            seen.push(fid);
+                        }
+                    }
+                }
+            }
+            d.border_nodes = borders;
+        }
 
         // 5. Seed one ShiftChange per district starting at t=0 (shift 1 begins).
         //    Each handler reschedules the next shift automatically.
@@ -203,7 +229,6 @@ impl City {
             event_buffer:  Vec::new(),
             next_flush:    FLUSH_EVERY_MINS,
             profiles,
-            travel_matrix,
             sim_type,
         }
     }
