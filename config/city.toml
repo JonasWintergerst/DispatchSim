@@ -30,6 +30,16 @@ tick_minutes     = 1
 duration_minutes = 2_102_400   # 4 simulated years
 rng_seed         = 42
 sim_type         = "Police"
+osm_path         = "config/hamburg-260331.osm.pbf"
+
+# Maps the abstract (col, row) hex grid onto Hamburg's geographic footprint.
+# row 0 = north (lat_max), row N = south (lat_min).
+# col 0 = west  (lon_min), col N = east  (lon_max).
+[hex_grid_bounds]
+lat_min = 53.395
+lat_max = 53.715
+lon_min =  9.730
+lon_max = 10.330
 
 # ---------------------------------------------------------------------------
 # Districts + stations

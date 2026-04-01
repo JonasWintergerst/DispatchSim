@@ -12,8 +12,12 @@ use crate::district::District;
 use crate::event_log::{Event, EventLog};
 use crate::event_queue::SimEvent;
 use crate::hex::{Hex, HexCoord};
+use crate::routing::RoutingEngine;
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
+use std::path::Path;
+
+use crate::osm::OsmGraph;
 use crate::types::{BorderNode, DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId, UnitId};
 use crate::unit::Unit;
 
@@ -108,7 +112,19 @@ impl City {
             hexes_by_district.entry(hex_cfg.district_id).or_default().push(hex_cfg);
         }
 
-        // 3. Build districts; unit and hex IDs are globally unique.
+        // 3. Load OSM road graph (if configured).
+        let osm: Option<OsmGraph> = cfg.city.sim.osm_path.as_ref().map(|p| {
+            println!("Loading OSM road graph from: {}", p);
+            let g = OsmGraph::load(Path::new(p)).expect("failed to load OSM PBF");
+            println!("  → {} road nodes, {} edges", g.node_count(), g.edge_count());
+            g
+        });
+
+        let bounds      = cfg.city.hex_grid_bounds;
+        let grid_cols   = cfg.hex_grid.cols as f64 - 1.0;
+        let grid_rows   = cfg.hex_grid.rows as f64 - 1.0;
+
+        // 4. Build districts; unit and hex IDs are globally unique.
         let mut next_unit_id: u32 = 0;
         let mut next_hex_id:  u32 = 0;
         let mut seed_rng = SmallRng::seed_from_u64(cfg.city.sim.rng_seed);
@@ -116,7 +132,7 @@ impl City {
         let mut districts: Vec<District> = cfg.city.districts.iter().map(|district_cfg| {
             let district_id = DistrictId::new(district_cfg.id);
 
-            let hexes: Vec<Hex> = hexes_by_district
+            let mut hexes: Vec<Hex> = hexes_by_district
                 .get(&district_cfg.id)
                 .map(|hs| {
                     hs.iter().map(|h| {
@@ -135,7 +151,41 @@ impl City {
                 })
                 .unwrap_or_default();
 
-            // Phase 1: use the first hex's node as the station location.
+            // Build routing engine: OSM-based if configured, else synthetic hex grid.
+            let routing = if let (Some(ref osm_graph), Some(b)) = (&osm, bounds) {
+                // Compute lat/lon for each hex from (col, row) + bounding box.
+                let hex_latlons: Vec<(f64, f64)> = hexes.iter().map(|h| {
+                    let lat = b.lat_max - (h.coord().row as f64 / grid_rows) * (b.lat_max - b.lat_min);
+                    let lon = b.lon_min + (h.coord().col as f64 / grid_cols) * (b.lon_max - b.lon_min);
+                    (lat, lon)
+                }).collect();
+
+                // Bounding box for the district's hexes.
+                let lat_min = hex_latlons.iter().map(|(la, _)| *la).fold(f64::MAX, f64::min);
+                let lat_max = hex_latlons.iter().map(|(la, _)| *la).fold(f64::MIN, f64::max);
+                let lon_min = hex_latlons.iter().map(|(_, lo)| *lo).fold(f64::MAX, f64::min);
+                let lon_max = hex_latlons.iter().map(|(_, lo)| *lo).fold(f64::MIN, f64::max);
+
+                let subgraph = osm_graph.subgraph_for_bbox(lat_min, lat_max, lon_min, lon_max, 0.02);
+
+                // Snap each hex to its nearest OSM road node.
+                let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
+                for (hex, &(lat, lon)) in hexes.iter_mut().zip(hex_latlons.iter()) {
+                    let node_id = osm_graph.nearest_node(lat, lon);
+                    hex.nearest_road_node = node_id;
+                    anchors.push(node_id);
+                }
+                anchors.sort();
+                anchors.dedup();
+
+                RoutingEngine::from_graph(subgraph, &anchors)
+            } else {
+                let hex_pairs: Vec<(NodeId, HexCoord)> =
+                    hexes.iter().map(|h| (h.node_id(), h.coord())).collect();
+                RoutingEngine::from_hex_grid(&hex_pairs)
+            };
+
+            // Station node is the nearest road node of the first hex (snapped if OSM).
             let station_node = hexes.first().map(|h| h.node_id()).unwrap_or(NodeId::new(0));
             let station_id   = StationId::new(district_cfg.station.id);
 
@@ -155,7 +205,7 @@ impl City {
             );
 
             let district_rng = SmallRng::seed_from_u64(seed_rng.random());
-            District::new(district_id, station, units, hexes, district_rng)
+            District::new(district_id, station, units, hexes, district_rng, routing)
         }).collect();
 
         // 4. Detect border nodes: hexes 8-adjacent to a hex in a different district.
