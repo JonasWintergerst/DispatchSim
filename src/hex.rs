@@ -35,9 +35,14 @@ pub struct Hex {
     pub district:          DistrictId,
     pub spawn_profile_id:  SpawnProfileId,
     /// Nearest OSM road node, used as the routing anchor for this hex.
-    pub nearest_road_node: NodeId,
+    /// `None` until snapped to the road network at startup; always `Some` by
+    /// the time the district's routing engine is constructed.
+    pub nearest_road_node: Option<NodeId>,
 }
 
 impl Hex {
-    pub fn node_id(&self) -> NodeId { self.nearest_road_node }
+    /// Panics if called before the hex has been snapped to the road network.
+    pub fn node_id(&self) -> NodeId {
+        self.nearest_road_node.expect("node_id() called before hex was snapped to road network")
+    }
 }

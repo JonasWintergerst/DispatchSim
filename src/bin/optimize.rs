@@ -143,6 +143,20 @@ fn main() {
         }
     }).collect();
 
+    // 5b. Filter hexes to those in the main road-network connected component.
+    //     Removes isolated enclaves (e.g. Neuwerk island) that have no road
+    //     connection to the main Hamburg network.
+    println!("Computing main road-network component…");
+    let main_nodes = osm.main_component_node_ids();
+    let before = hexes.len();
+    let hexes: Vec<H3Hex> = hexes.into_iter()
+        .filter(|h| main_nodes.contains(&dispatch_sim::types::NodeId::new(h.nearest_osm_node)))
+        .collect();
+    let removed = before - hexes.len();
+    if removed > 0 {
+        println!("  → Filtered {} disconnected hexes ({} remain)", removed, hexes.len());
+    }
+
     // 6. Build problem.
     let problem = Problem {
         hexes,

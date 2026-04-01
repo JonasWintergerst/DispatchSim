@@ -164,12 +164,17 @@ impl City {
                 let mut unit_cursor  = setup.unit_id_start;
 
                 // Build Hex objects from config; use pre-snapped OSM node if available.
+                // When no OSM is configured, assign a synthetic NodeId from the cursor
+                // so that the H3-adjacency routing engine has stable, unique IDs.
+                let use_osm = osm.is_some();
                 let mut hexes: Vec<Hex> = hexes_by_district
                     .get(&district_cfg.id)
                     .map(|hs| hs.iter().map(|h| {
-                        let node_id = h.nearest_osm_node
-                            .map(NodeId::new)
-                            .unwrap_or_else(|| NodeId::new(hex_cursor));
+                        let node_id = h.nearest_osm_node.map(NodeId::new).or_else(|| {
+                            // If not using OSM, assign a synthetic cursor-based ID now.
+                            // If using OSM, leave as None — will be re-snapped below.
+                            if use_osm { None } else { Some(NodeId::new(hex_cursor)) }
+                        });
                         let hex_id = HexId::new(hex_cursor);
                         hex_cursor += 1;
                         Hex {
@@ -195,13 +200,13 @@ impl City {
                         lat_min, lat_max, lon_min, lon_max, 0.02,
                     );
 
-                    // Re-snap any hex that has no pre-computed OSM node.
+                    // Re-snap any hex whose OSM node wasn't pre-computed by the optimizer.
                     let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
                     for hex in hexes.iter_mut() {
-                        if hex.nearest_road_node == NodeId::new(0) {
-                            hex.nearest_road_node = osm_graph.nearest_node(hex.lat, hex.lon);
+                        if hex.nearest_road_node.is_none() {
+                            hex.nearest_road_node = Some(osm_graph.nearest_node(hex.lat, hex.lon));
                         }
-                        anchors.push(hex.nearest_road_node);
+                        anchors.push(hex.nearest_road_node.unwrap());
                     }
                     anchors.sort();
                     anchors.dedup();
@@ -211,8 +216,10 @@ impl City {
                     build_h3_routing_engine(&hexes)
                 };
 
-                // Station node = first hex's road node (matches previous behaviour).
-                let station_node = hexes.first().map(|h| h.node_id()).unwrap_or(NodeId::new(0));
+                // Station node = first hex's road node (all hexes are snapped by here).
+                let station_node = hexes.first()
+                    .and_then(|h| h.nearest_road_node)
+                    .expect("district has no hexes — config validation should have caught this");
                 let station_id   = StationId::new(district_cfg.station.id);
 
                 let units: Vec<Unit> = (0..district_cfg.station.unit_count).map(|_| {

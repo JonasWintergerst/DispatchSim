@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 
 use rand::RngExt;
 use rand::rngs::SmallRng;
@@ -19,6 +19,25 @@ use crate::unit::Unit;
 
 /// Simulated minutes per shift (8 hours).
 const SHIFT_MINUTES: u64 = 480;
+
+/// Wrapper for incidents in the pending queue, ordered by priority rank (highest first).
+#[derive(Eq, PartialEq)]
+struct PendingIncident {
+    rank: u8,
+    id:   IncidentId,
+}
+
+impl Ord for PendingIncident {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank.cmp(&other.rank)
+    }
+}
+
+impl PartialOrd for PendingIncident {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 pub struct District {
     pub id:           DistrictId,

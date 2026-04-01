@@ -183,6 +183,16 @@ impl OsmGraph {
 
     pub fn node_count(&self) -> usize { self.graph.node_count() }
     pub fn edge_count(&self) -> usize { self.graph.edge_count() }
+
+    /// Returns the raw u32 node IDs of all nodes in the largest strongly-connected
+    /// component of the road graph. Used to filter out hexes in disconnected enclaves
+    /// (e.g. Neuwerk island) that have no road connection to the main network.
+    pub fn main_component_node_ids(&self) -> HashSet<NodeId> {
+        use petgraph::algo::kosaraju_scc;
+        let sccs = kosaraju_scc(&self.graph);
+        let largest = sccs.into_iter().max_by_key(|c| c.len()).unwrap_or_default();
+        largest.into_iter().map(|nx| self.graph[nx].id).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
