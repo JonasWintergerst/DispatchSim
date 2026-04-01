@@ -8,12 +8,11 @@ use crate::event_log::{Event, EventKind};
 use crate::event_queue::SimEvent;
 use crate::hex::Hex;
 use crate::incident::Incident;
-use crate::hex::HexCoord;
 use crate::routing::RoutingEngine;
 use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
-    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, NodeId, Priority,
+    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, Priority,
     SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
@@ -38,10 +37,14 @@ pub struct District {
 }
 
 impl District {
-    pub fn new(id: DistrictId, station: Station, units: Vec<Unit>, hexes: Vec<Hex>, rng: SmallRng) -> Self {
-        let hex_pairs: Vec<(NodeId, HexCoord)> =
-            hexes.iter().map(|h| (h.node_id(), h.coord())).collect();
-        let routing = RoutingEngine::from_hex_grid(&hex_pairs);
+    pub fn new(
+        id:      DistrictId,
+        station: Station,
+        units:   Vec<Unit>,
+        hexes:   Vec<Hex>,
+        rng:     SmallRng,
+        routing: RoutingEngine,
+    ) -> Self {
         District {
             id,
             station,

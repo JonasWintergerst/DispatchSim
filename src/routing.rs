@@ -71,26 +71,31 @@ impl RoutingEngine {
             }
         }
 
-        Self::build(graph, node_index)
+        let all_anchors: Vec<NodeId> = node_index.keys().copied().collect();
+        Self::build(graph, node_index, &all_anchors)
     }
 
-    /// Build from an externally-constructed road graph (Phase 2b OSM import).
-    pub fn from_graph(graph: RoadGraph) -> Self {
+    /// Build from an external road graph (OSM subgraph).
+    /// Only precomputes Dijkstra from `anchor_nodes` — the subset of nodes that
+    /// are actual incident/station locations. Keeps `travel_time()` O(1) for
+    /// anchor→any queries without running all-pairs on a large OSM subgraph.
+    pub fn from_graph(graph: RoadGraph, anchor_nodes: &[NodeId]) -> Self {
         let node_index: HashMap<NodeId, NodeIndex> = graph
             .node_indices()
             .map(|nx| (graph[nx].id, nx))
             .collect();
-        Self::build(graph, node_index)
+        Self::build(graph, node_index, anchor_nodes)
     }
 
-    fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>) -> Self {
-        let mut times: HashMap<(NodeId, NodeId), u32> =
-            HashMap::with_capacity(node_index.len() * node_index.len());
+    fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>, anchors: &[NodeId]) -> Self {
+        let mut times: HashMap<(NodeId, NodeId), u32> = HashMap::new();
 
-        for (&node_id, &nx) in &node_index {
-            let result = dijkstra(&graph, nx, None, |e| e.weight().travel_time_min);
-            for (&target_nx, &cost) in &result {
-                times.insert((node_id, graph[target_nx].id), cost);
+        for &node_id in anchors {
+            if let Some(&nx) = node_index.get(&node_id) {
+                let result = dijkstra(&graph, nx, None, |e| e.weight().travel_time_min);
+                for (&target_nx, &cost) in &result {
+                    times.insert((node_id, graph[target_nx].id), cost);
+                }
             }
         }
 

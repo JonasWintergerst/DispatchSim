@@ -96,7 +96,7 @@ impl IncidentId {
     pub fn value(&self) -> &str { &self.0 }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId(u32);
 impl NodeId {
     pub fn new(val: u32) -> Self { Self(val) }

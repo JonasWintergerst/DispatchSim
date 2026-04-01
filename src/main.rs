@@ -2,6 +2,7 @@
 
 mod city;
 mod clock;
+mod osm;
 mod config;
 mod district;
 mod event_log;

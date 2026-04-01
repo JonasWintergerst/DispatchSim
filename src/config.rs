@@ -42,7 +42,7 @@ impl LoadedConfig {
 pub struct CityConfig {
     pub sim: SimConfig,
 
-    /// Path to hexes.json, relative to the config file location.
+    /// Path to hexes.json, relative to the working directory.
     pub hex_grid_path: String,
 
     /// One entry per district — must match district_id values in hexes.json.
@@ -51,6 +51,18 @@ pub struct CityConfig {
     /// Spawn profiles referenced by spawn_profile_id in hexes.json.
     /// Key is the profile id string (e.g. "residential", "commercial").
     pub spawn_profiles: HashMap<String, SpawnProfileConfig>,
+
+    /// Maps the abstract hex grid onto geographic space.
+    /// Required when osm_path is set; ignored otherwise.
+    pub hex_grid_bounds: Option<HexGridBounds>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+pub struct HexGridBounds {
+    pub lat_min: f64,
+    pub lat_max: f64,
+    pub lon_min: f64,
+    pub lon_max: f64,
 }
 
 impl CityConfig {
@@ -72,6 +84,9 @@ pub struct SimConfig {
     /// The service type this entire simulation models: Fire | Police | Medical.
     /// All stations and units inherit this type — there is only one per sim run.
     pub sim_type: SimType,
+    /// Path to an OSM PBF file for real road routing. If absent, falls back to
+    /// synthetic hex-grid routing.
+    pub osm_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
