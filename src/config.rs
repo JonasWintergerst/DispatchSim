@@ -1,6 +1,6 @@
 // config.rs
 // Loads city.toml (sim params, stations, spawn profiles)
-// and hexes.json (spatial hex grid).
+// and hexes.json (H3 hex grid — a flat JSON array written by the optimizer).
 // Everything here is plain data — no sim logic.
 
 use std::collections::HashMap;
@@ -51,22 +51,10 @@ pub struct CityConfig {
     /// Spawn profiles referenced by spawn_profile_id in hexes.json.
     /// Key is the profile id string (e.g. "residential", "commercial").
     pub spawn_profiles: HashMap<String, SpawnProfileConfig>,
-
-    /// Maps the abstract hex grid onto geographic space.
-    /// Required when osm_path is set; ignored otherwise.
-    pub hex_grid_bounds: Option<HexGridBounds>,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-pub struct HexGridBounds {
-    pub lat_min: f64,
-    pub lat_max: f64,
-    pub lon_min: f64,
-    pub lon_max: f64,
 }
 
 impl CityConfig {
-    fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
         toml::from_str(&raw).map_err(ConfigError::Toml)
@@ -75,17 +63,12 @@ impl CityConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct SimConfig {
-    /// Minutes per tick (typically 1).
     pub tick_minutes: u32,
-    /// Total simulated minutes to run (4 years ≈ 2_102_400).
     pub duration_minutes: u64,
-    /// RNG seed for reproducibility.
     pub rng_seed: u64,
-    /// The service type this entire simulation models: Fire | Police | Medical.
-    /// All stations and units inherit this type — there is only one per sim run.
     pub sim_type: SimType,
-    /// Path to an OSM PBF file for real road routing. If absent, falls back to
-    /// synthetic hex-grid routing.
+    /// Path to an OSM PBF file for real road routing. If absent, falls back
+    /// to synthetic H3-adjacency routing.
     pub osm_path: Option<String>,
 }
 
@@ -100,46 +83,30 @@ pub struct DistrictConfig {
 pub struct StationConfig {
     pub id: u32,
     pub name: String,
-    /// How many units this station starts with.
     pub unit_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct UnitConfig {
-    pub id: u32,
-    // No unit_type field — all units share the city-wide sim_type.
-}
-
-#[derive(Debug, Deserialize)]
 pub struct SpawnProfileConfig {
-    /// Average incidents per hour at baseline.
     pub base_lambda: f64,
-    /// 24 multipliers, index = hour of day.
     pub hour_multiplier: [f64; 24],
-    /// 7 multipliers, index = day of week (0 = Monday).
     pub weekday_multiplier: [f64; 7],
-    /// 4 multipliers: [Spring, Summer, Autumn, Winter].
     pub season_multiplier: [f64; 4],
-    /// Incident type weights: list of [kind_string, weight] pairs.
     pub incident_weights: Vec<IncidentWeightConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct IncidentWeightConfig {
-    /// "Fire" | "MedicalEmergency" | "Crime" | "Accident"
     pub kind: String,
     pub weight: f64,
 }
 
 // ---------------------------------------------------------------------------
-// hexes.json structs
+// hexes.json structs — flat JSON array (written by the optimizer)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+/// The full hex grid as loaded from hexes.json.
 pub struct HexGridConfig {
-    pub cols: u32,
-    pub rows: u32,
-    pub districts: Vec<HexDistrictMeta>,
     pub hexes: Vec<HexConfig>,
 }
 
@@ -147,24 +114,25 @@ impl HexGridConfig {
     fn load(path: &Path) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path)
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
-        serde_json::from_str(&raw).map_err(ConfigError::Json)
+        let hexes: Vec<HexConfig> =
+            serde_json::from_str(&raw).map_err(ConfigError::Json)?;
+        Ok(Self { hexes })
     }
 }
 
-/// Metadata about a district as stored in hexes.json (name only — IDs come
-/// from the district_id field on each hex).
-#[derive(Debug, Deserialize)]
-pub struct HexDistrictMeta {
-    pub id: u32,
-    pub name: String,
-}
-
+/// One entry in hexes.json, produced by the optimizer.
 #[derive(Debug, Deserialize)]
 pub struct HexConfig {
-    pub col: i32,
-    pub row: i32,
+    /// Raw H3 cell index encoded as a u64 integer.
+    pub h3_index: u64,
+    /// Geographic centre of the cell (degrees).
+    pub lat: f64,
+    pub lon: f64,
     pub district_id: u32,
     pub spawn_profile_id: String,
+    /// Nearest OSM road node id (from `osm.rs` sequential numbering).
+    /// If None the simulator will snap the hex to the nearest node at startup.
+    pub nearest_osm_node: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -172,41 +140,37 @@ pub struct HexConfig {
 // ---------------------------------------------------------------------------
 
 fn validate(city: &CityConfig, grid: &HexGridConfig) -> Result<(), ConfigError> {
-    // Every district_id in hexes.json must have a matching entry in city.toml.
     let city_district_ids: std::collections::HashSet<u32> =
         city.districts.iter().map(|d| d.id).collect();
 
     for hex in &grid.hexes {
         if !city_district_ids.contains(&hex.district_id) {
             return Err(ConfigError::Validation(format!(
-                "hex ({},{}) references district_id {} which is not in city.toml",
-                hex.col, hex.row, hex.district_id
+                "hex h3_index={} references district_id {} which is not in city.toml",
+                hex.h3_index, hex.district_id
             )));
         }
         if !city.spawn_profiles.contains_key(&hex.spawn_profile_id) {
             return Err(ConfigError::Validation(format!(
-                "hex ({},{}) references spawn_profile_id '{}' which is not in city.toml",
-                hex.col, hex.row, hex.spawn_profile_id
+                "hex h3_index={} references spawn_profile_id '{}' which is not in city.toml",
+                hex.h3_index, hex.spawn_profile_id
             )));
         }
     }
 
-    // Every district in city.toml must have at least one hex.
     let hex_district_ids: std::collections::HashSet<u32> =
         grid.hexes.iter().map(|h| h.district_id).collect();
 
     for district in &city.districts {
         if !hex_district_ids.contains(&district.id) {
             return Err(ConfigError::Validation(format!(
-                "district '{}' (id {}) has no hexes in the hex grid",
+                "district '{}' (id {}) has no hexes in hexes.json — run the optimizer first",
                 district.name, district.id
             )));
         }
     }
 
-    // Station IDs must be unique across the whole city.
     let mut station_ids = std::collections::HashSet::new();
-
     for district in &city.districts {
         let sid = district.station.id;
         if !station_ids.insert(sid) {

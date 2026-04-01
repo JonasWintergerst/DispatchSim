@@ -9,15 +9,43 @@ use std::path::Path;
 use geo::Point;
 use osmpbf::{Element, ElementReader};
 use petgraph::graph::NodeIndex;
+use rstar::{RTree, RTreeObject, AABB, PointDistance};
 
+use crate::geo_utils::haversine_m;
 use crate::routing::{Edge, Node, RoadGraph};
 use crate::types::NodeId;
 
 // ---------------------------------------------------------------------------
+// R-tree entry for O(log n) nearest-node queries.
+
+#[derive(Clone)]
+struct RTreeNode {
+    id:  NodeId,
+    lat: f64,
+    lon: f64,
+}
+
+impl RTreeObject for RTreeNode {
+    type Envelope = AABB<[f64; 2]>;
+    fn envelope(&self) -> Self::Envelope {
+        AABB::from_point([self.lon, self.lat])
+    }
+}
+
+impl PointDistance for RTreeNode {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let dlat = self.lat - point[1];
+        let dlon = self.lon - point[0];
+        dlat * dlat + dlon * dlon
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 pub struct OsmGraph {
-    graph: RoadGraph,
-    /// (NodeId, lat, lon) kept separately for O(N) nearest-node search.
+    graph:  RoadGraph,
+    rtree:  RTree<RTreeNode>,
+    /// (NodeId, lat, lon) kept for bbox filtering in subgraph_for_bbox.
     node_positions: Vec<(NodeId, f64, f64)>,
 }
 
@@ -94,19 +122,18 @@ impl OsmGraph {
             }
         }
 
-        Ok(Self { graph, node_positions })
+        let rtree = RTree::bulk_load(
+            node_positions.iter().map(|&(id, lat, lon)| RTreeNode { id, lat, lon }).collect()
+        );
+
+        Ok(Self { graph, rtree, node_positions })
     }
 
-    /// Nearest road node to (lat, lon) by Haversine distance.
+    /// Nearest road node to (lat, lon). O(log n) via R-tree.
     pub fn nearest_node(&self, lat: f64, lon: f64) -> NodeId {
-        self.node_positions
-            .iter()
-            .min_by(|(_, la, lo), (_, lb, lo2)| {
-                let da = haversine_m(lat, lon, *la, *lo);
-                let db = haversine_m(lat, lon, *lb, *lo2);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|(id, _, _)| *id)
+        self.rtree
+            .nearest_neighbor(&[lon, lat])
+            .map(|n| n.id)
             .expect("OsmGraph has no nodes")
     }
 
@@ -176,13 +203,4 @@ fn speed_m_per_min(highway: &str) -> f64 {
     km_h * 1000.0 / 60.0
 }
 
-/// Haversine distance in metres between two (lat, lon) points.
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    R * c
-}
+// haversine_m moved to geo_utils — re-exported here for callers within this module.

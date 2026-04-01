@@ -1,6 +1,9 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::path::Path;
 
+use h3o::CellIndex;
+use petgraph::graph::NodeIndex;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::RngExt;
@@ -11,14 +14,16 @@ use crate::config::{LoadedConfig, SpawnProfileConfig};
 use crate::district::District;
 use crate::event_log::{Event, EventLog};
 use crate::event_queue::SimEvent;
-use crate::hex::{Hex, HexCoord};
-use crate::routing::RoutingEngine;
+use crate::geo_utils::haversine_m;
+use crate::hex::Hex;
+use crate::osm::OsmGraph;
+use crate::routing::{Edge, Node, RoadGraph, RoutingEngine};
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
-use std::path::Path;
-
-use crate::osm::OsmGraph;
-use crate::types::{BorderNode, DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId, UnitId};
+use crate::types::{
+    BorderNode, DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId,
+    UnitId,
+};
 use crate::unit::Unit;
 
 /// Flush buffered log events to SQLite every this many simulated minutes (1 sim-day).
@@ -40,12 +45,11 @@ impl City {
         let next_time = match self.event_heap.peek() {
             Some(Reverse(ev)) => match ev.time() {
                 Some(t) => t,
-                None    => { self.event_heap.pop(); return; } // stray NoOp
+                None    => { self.event_heap.pop(); return; }
             },
             None => return,
         };
 
-        // Drain all events scheduled for this tick and group by district.
         let mut district_batches: HashMap<DistrictId, Vec<SimEvent>> = HashMap::new();
         while let Some(Reverse(ev)) = self.event_heap.peek() {
             if ev.time() != Some(next_time) { break; }
@@ -53,7 +57,6 @@ impl City {
             if let Some(did) = ev.district_id() {
                 district_batches.entry(did).or_default().push(ev);
             }
-            // NoOp has no district — discard it
         }
 
         let profiles = &self.profiles;
@@ -81,8 +84,6 @@ impl City {
         }
     }
 
-    /// Flush any buffered log events to SQLite. Called automatically every
-    /// FLUSH_EVERY_MINS of sim time and once at the end of the run.
     pub fn flush(&mut self) {
         if self.event_buffer.is_empty() { return; }
         self.event_log
@@ -91,8 +92,6 @@ impl City {
         self.event_buffer.clear();
     }
 
-    /// Build a fully-initialised City from a loaded config.
-    /// After this call the sim is ready to tick.
     pub fn from_config(cfg: &LoadedConfig) -> Self {
         let sim_type = cfg.city.sim.sim_type;
 
@@ -112,7 +111,7 @@ impl City {
             hexes_by_district.entry(hex_cfg.district_id).or_default().push(hex_cfg);
         }
 
-        // 3. Load OSM road graph (if configured).
+        // 3. Load OSM road graph (if configured)
         let osm: Option<OsmGraph> = cfg.city.sim.osm_path.as_ref().map(|p| {
             println!("Loading OSM road graph from: {}", p);
             let g = OsmGraph::load(Path::new(p)).expect("failed to load OSM PBF");
@@ -120,11 +119,7 @@ impl City {
             g
         });
 
-        let bounds      = cfg.city.hex_grid_bounds;
-        let grid_cols   = cfg.hex_grid.cols as f64 - 1.0;
-        let grid_rows   = cfg.hex_grid.rows as f64 - 1.0;
-
-        // 4. Build districts; unit and hex IDs are globally unique.
+        // 4. Build districts
         let mut next_unit_id: u32 = 0;
         let mut next_hex_id:  u32 = 0;
         let mut seed_rng = SmallRng::seed_from_u64(cfg.city.sim.rng_seed);
@@ -132,60 +127,55 @@ impl City {
         let mut districts: Vec<District> = cfg.city.districts.iter().map(|district_cfg| {
             let district_id = DistrictId::new(district_cfg.id);
 
+            // Build Hex objects from config; use pre-snapped OSM node if available.
             let mut hexes: Vec<Hex> = hexes_by_district
                 .get(&district_cfg.id)
-                .map(|hs| {
-                    hs.iter().map(|h| {
-                        let coord   = HexCoord::new(h.col, h.row);
-                        let node_id = NodeId::from_hex(&coord);
-                        let hex_id  = HexId::new(next_hex_id);
-                        next_hex_id += 1;
-                        Hex::new(
-                            hex_id,
-                            coord,
-                            district_id,
-                            SpawnProfileId::new(h.spawn_profile_id.clone()),
-                            node_id,
-                        )
-                    }).collect()
-                })
+                .map(|hs| hs.iter().map(|h| {
+                    let node_id = h.nearest_osm_node
+                        .map(NodeId::new)
+                        .unwrap_or_else(|| NodeId::new(next_hex_id));
+                    let hex_id = HexId::new(next_hex_id);
+                    next_hex_id += 1;
+                    Hex {
+                        id:                hex_id,
+                        h3_index:          h.h3_index,
+                        lat:               h.lat,
+                        lon:               h.lon,
+                        district:          district_id,
+                        spawn_profile_id:  SpawnProfileId::new(h.spawn_profile_id.clone()),
+                        nearest_road_node: node_id,
+                    }
+                }).collect())
                 .unwrap_or_default();
 
-            // Build routing engine: OSM-based if configured, else synthetic hex grid.
-            let routing = if let (Some(ref osm_graph), Some(b)) = (&osm, bounds) {
-                // Compute lat/lon for each hex from (col, row) + bounding box.
-                let hex_latlons: Vec<(f64, f64)> = hexes.iter().map(|h| {
-                    let lat = b.lat_max - (h.coord().row as f64 / grid_rows) * (b.lat_max - b.lat_min);
-                    let lon = b.lon_min + (h.coord().col as f64 / grid_cols) * (b.lon_max - b.lon_min);
-                    (lat, lon)
-                }).collect();
+            // Build routing engine: OSM-based if configured, else H3-adjacency.
+            let routing = if let Some(ref osm_graph) = osm {
+                let lat_min = hexes.iter().map(|h| h.lat).fold(f64::MAX, f64::min);
+                let lat_max = hexes.iter().map(|h| h.lat).fold(f64::MIN, f64::max);
+                let lon_min = hexes.iter().map(|h| h.lon).fold(f64::MAX, f64::min);
+                let lon_max = hexes.iter().map(|h| h.lon).fold(f64::MIN, f64::max);
 
-                // Bounding box for the district's hexes.
-                let lat_min = hex_latlons.iter().map(|(la, _)| *la).fold(f64::MAX, f64::min);
-                let lat_max = hex_latlons.iter().map(|(la, _)| *la).fold(f64::MIN, f64::max);
-                let lon_min = hex_latlons.iter().map(|(_, lo)| *lo).fold(f64::MAX, f64::min);
-                let lon_max = hex_latlons.iter().map(|(_, lo)| *lo).fold(f64::MIN, f64::max);
+                let subgraph = osm_graph.subgraph_for_bbox(
+                    lat_min, lat_max, lon_min, lon_max, 0.02,
+                );
 
-                let subgraph = osm_graph.subgraph_for_bbox(lat_min, lat_max, lon_min, lon_max, 0.02);
-
-                // Snap each hex to its nearest OSM road node.
+                // Re-snap any hex that has no pre-computed OSM node (nearest_osm_node was None).
                 let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
-                for (hex, &(lat, lon)) in hexes.iter_mut().zip(hex_latlons.iter()) {
-                    let node_id = osm_graph.nearest_node(lat, lon);
-                    hex.nearest_road_node = node_id;
-                    anchors.push(node_id);
+                for hex in hexes.iter_mut() {
+                    if hex.nearest_road_node == NodeId::new(0) {
+                        hex.nearest_road_node = osm_graph.nearest_node(hex.lat, hex.lon);
+                    }
+                    anchors.push(hex.nearest_road_node);
                 }
                 anchors.sort();
                 anchors.dedup();
 
                 RoutingEngine::from_graph(subgraph, &anchors)
             } else {
-                let hex_pairs: Vec<(NodeId, HexCoord)> =
-                    hexes.iter().map(|h| (h.node_id(), h.coord())).collect();
-                RoutingEngine::from_hex_grid(&hex_pairs)
+                build_h3_routing_engine(&hexes)
             };
 
-            // Station node is the nearest road node of the first hex (snapped if OSM).
+            // Station node = first hex's road node (matches previous behaviour).
             let station_node = hexes.first().map(|h| h.node_id()).unwrap_or(NodeId::new(0));
             let station_id   = StationId::new(district_cfg.station.id);
 
@@ -208,40 +198,37 @@ impl City {
             District::new(district_id, station, units, hexes, district_rng, routing)
         }).collect();
 
-        // 4. Detect border nodes: hexes 8-adjacent to a hex in a different district.
-        //    Stored per district as the Phase 2 mutual-aid hook.
-        let mut coord_to_district: HashMap<(i32, i32), DistrictId> =
-            HashMap::with_capacity(cfg.hex_grid.hexes.len());
+        // 5. Detect border nodes using H3 cell adjacency (grid_disk(1)).
+        let mut cell_to_district: HashMap<u64, DistrictId> = HashMap::new();
         for d in &districts {
             for h in &d.hexes {
-                coord_to_district.insert((h.coord().col, h.coord().row), d.id);
+                cell_to_district.insert(h.h3_index, d.id);
             }
         }
-
-        const NEIGHBOURS: [(i32, i32); 8] = [
-            (-1, 0), (1, 0), (0, -1), (0, 1),
-            (-1, -1), (-1, 1), (1, -1), (1, 1),
-        ];
 
         for d in &mut districts {
             let mut borders: Vec<BorderNode> = Vec::new();
             for h in &d.hexes {
-                let (c, r) = (h.coord().col, h.coord().row);
-                let mut seen: Vec<DistrictId> = Vec::new();
-                for (dc, dr) in NEIGHBOURS {
-                    if let Some(&fid) = coord_to_district.get(&(c + dc, r + dr)) {
-                        if fid != d.id && !seen.contains(&fid) {
-                            borders.push(BorderNode { node_id: h.node_id(), neighbour_district: fid });
-                            seen.push(fid);
+                if let Ok(cell) = CellIndex::try_from(h.h3_index) {
+                    let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
+                    for nbr in disk {
+                        let nbr_u64 = u64::from(nbr);
+                        if let Some(&fid) = cell_to_district.get(&nbr_u64) {
+                            if fid != d.id {
+                                borders.push(BorderNode {
+                                    node_id:            h.node_id(),
+                                    neighbour_district: fid,
+                                });
+                            }
                         }
                     }
                 }
             }
+            borders.dedup_by_key(|b| (b.node_id, b.neighbour_district));
             d.border_nodes = borders;
         }
 
-        // 5. Seed one ShiftChange per district starting at t=0 (shift 1 begins).
-        //    Each handler reschedules the next shift automatically.
+        // 6. Seed ShiftChange events (one per district at t=0).
         let mut event_heap: BinaryHeap<Reverse<SimEvent>> = BinaryHeap::new();
         for district in &districts {
             event_heap.push(Reverse(SimEvent::ShiftChange {
@@ -250,9 +237,7 @@ impl City {
             }));
         }
 
-        // 6. Seed one IncidentSpawn per hex, staggered by drawing the first
-        //    inter-arrival time from the spawn profile. This avoids an
-        //    artificial burst of events at t=0.
+        // 7. Seed IncidentSpawn events (one per hex, staggered).
         for district in &districts {
             for hex in &district.hexes {
                 let first_time = crate::spawner::next_spawn_time(
@@ -275,13 +260,56 @@ impl City {
             clock:         SimClock::new(),
             districts,
             event_heap,
-            event_log:     EventLog::open("./output/dispatch_sim.db").expect("could not open event log"),
+            event_log:     EventLog::open("./output/dispatch_sim.db")
+                               .expect("could not open event log"),
             event_buffer:  Vec::new(),
             next_flush:    FLUSH_EVERY_MINS,
             profiles,
             sim_type,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// H3-adjacency routing fallback (used when no OSM path is configured)
+// ---------------------------------------------------------------------------
+
+/// Build a RoutingEngine from H3 cell adjacency with haversine-based travel times.
+/// Each hex is connected to its H3 grid-disk-1 neighbors present in the district.
+/// Assumes an average road speed of 30 km/h.
+fn build_h3_routing_engine(hexes: &[Hex]) -> RoutingEngine {
+    const SPEED_M_PER_MIN: f64 = 30_000.0 / 60.0; // 30 km/h
+
+    let mut graph: RoadGraph = RoadGraph::new();
+    let mut nx_by_h3: HashMap<u64, NodeIndex> = HashMap::with_capacity(hexes.len());
+
+    for hex in hexes {
+        let nx = graph.add_node(Node {
+            id:       hex.node_id(),
+            position: geo::Point::new(hex.lon, hex.lat),
+        });
+        nx_by_h3.insert(hex.h3_index, nx);
+    }
+
+    for hex in hexes {
+        if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
+            let from_nx = nx_by_h3[&hex.h3_index];
+            let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
+            for nbr in disk {
+                let nbr_u64 = u64::from(nbr);
+                if nbr_u64 == hex.h3_index { continue; }
+                if let Some(&to_nx) = nx_by_h3.get(&nbr_u64) {
+                    let nc = h3o::LatLng::from(nbr);
+                    let dist_m = haversine_m(hex.lat, hex.lon, nc.lat(), nc.lng());
+                    let time_min = ((dist_m / SPEED_M_PER_MIN) as u32).max(1);
+                    graph.add_edge(from_nx, to_nx, Edge { travel_time_min: time_min });
+                }
+            }
+        }
+    }
+
+    let anchors: Vec<NodeId> = hexes.iter().map(|h| h.node_id()).collect();
+    RoutingEngine::from_graph(graph, &anchors)
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +338,9 @@ fn parse_incident_kind(s: &str) -> IncidentKind {
         "MedicalEmergency" => IncidentKind::MedicalEmergency,
         "Crime"            => IncidentKind::Crime,
         "Accident"         => IncidentKind::Accident,
-        other              => panic!("unknown incident kind '{}' in spawn profile — check city.toml", other),
+        other              => panic!(
+            "unknown incident kind '{}' in spawn profile — check city.toml",
+            other
+        ),
     }
 }

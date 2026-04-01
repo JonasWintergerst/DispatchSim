@@ -1,34 +1,16 @@
-// main.rs
-
-mod city;
-mod clock;
-mod osm;
-mod config;
-mod district;
-mod event_log;
-mod event_queue;
-mod hex;
-mod incident;
-mod report;
-mod routing;
-mod spawner;
-mod station;
-mod types;
-mod unit;
-
 use std::path::Path;
 use std::process;
 use std::time::Instant;
 
-use config::LoadedConfig;
-use city::City;
+use dispatch_sim::city::City;
+use dispatch_sim::config::LoadedConfig;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.get(1).map(String::as_str) == Some("report") {
         let db_path = args.get(2).map(String::as_str).unwrap_or("./output/dispatch_sim.db");
-        report::print_report(db_path).unwrap_or_else(|e| {
+        dispatch_sim::report::print_report(db_path).unwrap_or_else(|e| {
             eprintln!("error reading database: {}", e);
             process::exit(1);
         });
@@ -70,13 +52,11 @@ fn run(mut city: City, cfg: &LoadedConfig) {
     let sim_end = cfg.city.sim.duration_minutes;
     let log_every = 10_000;
 
-    // Upper bound for progress — actual iterations will be far fewer
     println!("Starting sim — {} min simulated time", sim_end);
     let now = Instant::now();
 
     let mut tick = 0u64;
     loop {
-        // Stop when heap is empty or clock has passed sim end
         if city.event_heap.is_empty() || city.clock.elapsed_min >= sim_end {
             break;
         }
@@ -105,13 +85,11 @@ fn run(mut city: City, cfg: &LoadedConfig) {
 // Config path resolution
 // ---------------------------------------------------------------------------
 
-/// Checks CLI args first, falls back to the default location.
 fn resolve_config_path() -> std::path::PathBuf {
     if let Some(path) = std::env::args().nth(1) {
         return std::path::PathBuf::from(path);
     }
 
-    // Default: look for config/city.toml next to the binary.
     let default = Path::new("config/city.toml");
     if default.exists() {
         return default.to_path_buf();

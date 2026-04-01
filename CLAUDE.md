@@ -5,16 +5,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo build                   # Debug build
-cargo build --release         # Optimized build
-cargo run -- config/city.toml # Run simulation (default config path)
-cargo test                    # Run all tests
-cargo test <test_name>        # Run a single test by name
-cargo clippy                  # Lint
-cargo fmt                     # Format code
+cargo build                                          # Debug build
+cargo build --release                                # Optimized build
+cargo run --bin optimize -- config/optimize.toml     # Run district optimizer → writes config/hexes.json
+cargo run --bin dispatch_sim -- config/city.toml     # Run simulation
+cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # Print summary report
+cargo test                                           # Run all tests
+cargo test <test_name>                               # Run a single test by name
+cargo clippy                                         # Lint
+cargo fmt                                            # Format code
 ```
 
+The project has two binaries — always use `--bin`:
+- **`optimize`** — p-median district optimizer; reads `config/optimize.toml`, writes `config/hexes.json`
+- **`dispatch_sim`** — discrete-event simulator; reads `config/city.toml` and `config/hexes.json`
+
 The simulation outputs a SQLite database to `./output/dispatch_sim.db`.
+
+### Optimizer prerequisites
+
+The optimizer requires two external files (not in the repo):
+
+| File | Source |
+|------|--------|
+| `config/hamburg-latest.osm.pbf` | [Geofabrik Hamburg](https://download.geofabrik.de/europe/germany/hamburg.html) (~50 MB) |
+| `config/hamburg.geojson` | Simplified boundary already in repo; replace with real boundary from [OSM Boundaries](https://osm-boundaries.com) if needed |
+
+Typical workflow:
+```bash
+cargo run --bin optimize -- config/optimize.toml   # step 1: optimise
+cargo run --bin dispatch_sim -- config/city.toml   # step 2: simulate
+cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # step 3: report
+```
 
 ## Architecture
 
@@ -69,7 +91,8 @@ Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` o
 ### Configuration
 
 - `config/city.toml` — simulation parameters, district definitions (station + unit counts), and spawn profiles (`residential`, `commercial`, `mixed`) with λ and multiplier arrays
-- `config/hexes.json` — hex grid layout: one entry per cell with `col`, `row`, `district_id`, `spawn_profile_id`
+- `config/hexes.json` — flat JSON array produced by the optimizer; one entry per H3 cell with `h3_index`, `lat`, `lon`, `district_id`, `spawn_profile_id`, `nearest_osm_node`
+- `config/optimize.toml` — optimizer parameters: `n_districts`, `h3_resolution`, area boundary, OSM path, solver algorithm, constraints
 
 ### Key Design Decisions
 
@@ -79,9 +102,8 @@ Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` o
 
 ### Known Gaps / Planned Work
 
-- `routing.rs` returns direct-hop routes with Chebyshev distance; will be replaced by OSM road graph + Dijkstra (petgraph already a dependency)
 - `ShiftChange` logs boundaries but does not yet rotate crews or change unit availability
 - Patrol routes are not yet modelled — open question on route generation and mid-patrol position
-- `rstar` (R-tree) and `ratatui` (TUI) are dependencies imported but unused — planned for spatial indexing and visualization
 - Inter-district mutual aid is scaffolded (`DistrictMsg` in `types.rs`) but not wired up
-- `TravelMatrix` is an O(N²) precomputed HashMap; acceptable for Phase 1 but will be replaced once routing is graph-based
+- `ratatui` (TUI) is a dependency planned for live visualization but not yet wired up
+- Optimizer uses haversine distance proxy for the p-median objective; a road-network travel-time matrix would give more accurate results but requires full Dijkstra over the OSM graph
