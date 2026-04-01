@@ -20,6 +20,9 @@ use rayon::prelude::*;
 use crate::geo_utils::haversine_m;
 use super::{H3Hex, OptimizerError, Problem, Solution};
 
+// Precomputed H3 adjacency list: adj[i] = indices of hex neighbours within the hex set.
+type Adj = Vec<Vec<usize>>;
+
 pub struct GreedySolver;
 
 impl super::Solver for GreedySolver {
@@ -72,8 +75,9 @@ impl super::Solver for GreedySolver {
             println!("  Station {}/{}: hex {} selected — objective {:.1}", round + 1, p, best, total_obj);
         }
 
-        // 3. Voronoi assignment.
+        // 3. Voronoi assignment (parallel: each hex independently picks nearest station).
         let mut assignments: Vec<usize> = (0..n)
+            .into_par_iter()
             .map(|h| {
                 station_indices.iter().copied().enumerate()
                     .min_by(|&(_, s1), &(_, s2)| d(h, s1).partial_cmp(&d(h, s2)).unwrap())
@@ -82,14 +86,18 @@ impl super::Solver for GreedySolver {
             })
             .collect();
 
+        // Precompute adjacency list once; reused by both repair phases.
+        let cell_map = build_cell_map(hexes);
+        let adj      = build_adjacency(hexes, &cell_map);
+
         // 4. Contiguity repair.
         if problem.constraints.contiguity {
-            repair_contiguity(hexes, &mut assignments, &station_indices, p);
+            repair_contiguity(&mut assignments, &adj, &station_indices, p);
         }
 
         // 5. Workload balance repair.
         if let Some(ratio) = problem.constraints.max_workload_ratio {
-            repair_workload(hexes, &mut assignments, &station_indices, p, ratio);
+            repair_workload(hexes, &mut assignments, &adj, &station_indices, p, ratio);
         }
 
         // 6. Build solution.
@@ -119,13 +127,12 @@ fn gain_of(
 // ---------------------------------------------------------------------------
 
 fn repair_contiguity(
-    hexes:   &[H3Hex],
-    assigns: &mut Vec<usize>,
+    assigns:  &mut Vec<usize>,
+    adj:      &Adj,
     stations: &[usize],
-    p:       usize,
+    p:        usize,
 ) {
-    let n        = hexes.len();
-    let cell_map = build_cell_map(hexes);
+    let n = assigns.len();
 
     for d in 0..p {
         let start = stations[d];
@@ -137,7 +144,7 @@ fn repair_contiguity(
         queue.push_back(start);
 
         while let Some(i) = queue.pop_front() {
-            for j in h3_neighbors(hexes, &cell_map, i) {
+            for &j in &adj[i] {
                 if assigns[j] == d && reachable.insert(j) {
                     queue.push_back(j);
                 }
@@ -147,11 +154,7 @@ fn repair_contiguity(
         // Reassign disconnected hexes to an adjacent district.
         for i in 0..n {
             if assigns[i] == d && !reachable.contains(&i) {
-                if let Some(new_d) = h3_neighbors(hexes, &cell_map, i)
-                    .into_iter()
-                    .find(|&j| assigns[j] != d)
-                    .map(|j| assigns[j])
-                {
+                if let Some(new_d) = adj[i].iter().find(|&&j| assigns[j] != d).map(|&j| assigns[j]) {
                     assigns[i] = new_d;
                 }
             }
@@ -164,14 +167,14 @@ fn repair_contiguity(
 // ---------------------------------------------------------------------------
 
 fn repair_workload(
-    hexes:   &[H3Hex],
-    assigns: &mut Vec<usize>,
+    hexes:    &[H3Hex],
+    assigns:  &mut Vec<usize>,
+    adj:      &Adj,
     stations: &[usize],
-    p:       usize,
-    limit:   f64,
+    p:        usize,
+    limit:    f64,
 ) {
-    let n        = hexes.len();
-    let cell_map = build_cell_map(hexes);
+    let n = hexes.len();
 
     for _iter in 0..2_000 {
         let loads    = district_loads(hexes, assigns, p);
@@ -195,12 +198,10 @@ fn repair_workload(
             if assigns[i] != over  { continue; }
             if i == stations[over] { continue; } // never move station hex
 
-            let adj_to_under = h3_neighbors(hexes, &cell_map, i)
-                .iter()
-                .any(|&j| assigns[j] == under);
+            let adj_to_under = adj[i].iter().any(|&j| assigns[j] == under);
             if !adj_to_under { continue; }
 
-            if bfs_connected_without(hexes, assigns, &cell_map, stations[over], i, over) {
+            if bfs_connected_without(assigns, adj, stations[over], i, over) {
                 assigns[i] = under;
                 swapped = true;
                 break;
@@ -253,14 +254,14 @@ fn build_cell_map(hexes: &[H3Hex]) -> HashMap<u64, usize> {
     hexes.iter().enumerate().map(|(i, h)| (h.index, i)).collect()
 }
 
-/// Indices of hexes that are H3 grid-disk-1 neighbours of hexes[i].
-fn h3_neighbors(hexes: &[H3Hex], cell_map: &HashMap<u64, usize>, i: usize) -> Vec<usize> {
-    let Ok(cell) = CellIndex::try_from(hexes[i].index) else { return vec![]; };
-    let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
-    disk.iter()
-        .filter_map(|nbr| cell_map.get(&u64::from(*nbr)).copied())
-        .filter(|&j| j != i)
-        .collect()
+fn build_adjacency(hexes: &[H3Hex], cell_map: &HashMap<u64, usize>) -> Adj {
+    hexes.iter().enumerate().map(|(i, h)| {
+        let Ok(cell) = CellIndex::try_from(h.index) else { return vec![]; };
+        cell.grid_disk::<Vec<_>>(1).iter()
+            .filter_map(|nbr| cell_map.get(&u64::from(*nbr)).copied())
+            .filter(|&j| j != i)
+            .collect()
+    }).collect()
 }
 
 fn district_loads(hexes: &[H3Hex], assigns: &[usize], p: usize) -> Vec<f64> {
@@ -271,11 +272,10 @@ fn district_loads(hexes: &[H3Hex], assigns: &[usize], p: usize) -> Vec<f64> {
     loads
 }
 
-/// Returns true if hexes[start]..district d is still connected after removing hexes[excluded].
+/// Returns true if district `district` is still connected after removing `excluded`.
 fn bfs_connected_without(
-    hexes:    &[H3Hex],
     assigns:  &[usize],
-    cell_map: &HashMap<u64, usize>,
+    adj:      &Adj,
     start:    usize,
     excluded: usize,
     district: usize,
@@ -289,7 +289,7 @@ fn bfs_connected_without(
     queue.push_back(start);
 
     while let Some(i) = queue.pop_front() {
-        for j in h3_neighbors(hexes, cell_map, i) {
+        for &j in &adj[i] {
             if j != excluded && assigns[j] == district && reachable.insert(j) {
                 queue.push_back(j);
             }

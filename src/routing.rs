@@ -4,12 +4,13 @@
 //   - route_between: lazy A* with RwLock cache (Sync for Rayon districts).
 // Phase 2b hook: from_graph() accepts any externally-built RoadGraph (e.g. OSM).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 
 use geo::Point;
 use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{Graph, NodeIndex};
+use rayon::prelude::*;
 
 use crate::hex::HexCoord;
 use crate::types::NodeId;
@@ -88,16 +89,21 @@ impl RoutingEngine {
     }
 
     fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>, anchors: &[NodeId]) -> Self {
-        let mut times: HashMap<(NodeId, NodeId), u32> = HashMap::new();
+        // Only keep anchor→anchor travel times; anchor→intermediate-node distances
+        // are never queried and would otherwise inflate memory to O(|anchors|×|graph|).
+        let anchor_ids: HashSet<NodeId> = anchors.iter().copied().collect();
 
-        for &node_id in anchors {
-            if let Some(&nx) = node_index.get(&node_id) {
-                let result = dijkstra(&graph, nx, None, |e| e.weight().travel_time_min);
-                for (&target_nx, &cost) in &result {
-                    times.insert((node_id, graph[target_nx].id), cost);
-                }
-            }
-        }
+        let times: HashMap<(NodeId, NodeId), u32> = anchors
+            .par_iter()
+            .filter_map(|&node_id| node_index.get(&node_id).map(|&nx| (node_id, nx)))
+            .flat_map(|(node_id, nx)| {
+                dijkstra(&graph, nx, None, |e| e.weight().travel_time_min)
+                    .into_iter()
+                    .filter(|(target_nx, _)| anchor_ids.contains(&graph[*target_nx].id))
+                    .map(|(target_nx, cost)| ((node_id, graph[target_nx].id), cost))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
 
         Self { graph, node_index, times, routes: RwLock::new(HashMap::new()) }
     }

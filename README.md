@@ -70,6 +70,27 @@ Stale events (unit reassigned between scheduling and firing) are detected by a `
 
 ---
 
+## Performance
+
+Measured on AMD Ryzen 5 2600 (6 cores, 3.4 GHz), 16 GB RAM, Windows 11 — release build, 24 districts, Hamburg OSM (757 k road nodes, 1.7 M edges), 7 500 H3 cells at resolution 9, 4 simulated years.
+
+| Phase | Time |
+|-------|------|
+| Setup (OSM load + Dijkstra) | **16 s** |
+| 4-year simulation (~1.9 M events) | **~3 min** |
+| Peak memory | **~220 MB** |
+
+```bash
+# Reproduce these numbers
+cargo build --release
+
+cargo run --release --bin optimize -- config/optimize.toml
+
+cargo run --release --bin dispatch_sim -- config/city.toml
+```
+
+---
+
 ## Getting started
 
 ### Prerequisites
@@ -168,12 +189,49 @@ For resolution 9 (~7 500 hexes) the solver completes in a few seconds on a moder
 
 ## Output
 
-The simulator writes a SQLite database to `./output/dispatch_sim.db` with one row per event (spawn, dispatch, arrival, resolve, return, shift change). The `report` subcommand prints a per-district summary:
+The simulator writes a SQLite database to `./output/dispatch_sim.db` with one row per event (spawn, dispatch, arrival, resolve, return, shift change).
 
-- Total incidents dispatched
-- Mean and 90th-percentile response time (minutes)
-- Unit utilisation (%)
-- Queued (unserved) incident count
+### Report
+
+```bash
+cargo run --release --bin dispatch_sim -- report output/dispatch_sim.db
+```
+
+Prints a terminal summary covering:
+
+- **Simulation overview** — duration, total events logged
+- **Incidents** — spawned, resolved, open/queued count
+- **Response time per district** — N, mean, P50, P95, max (spawn → unit arrival, minutes)
+- **On-scene duration** — mean, P50, P95, max (arrival → resolved)
+- **Unit utilisation per district** — average, min, and max busy % per unit
+- **Incidents by hour of day** — total and per-day average across the simulation
+
+Example output (24 districts, 4 simulated years, ~300 calls/day):
+
+```
+=== dispatch_sim Analysis Report ===
+
+Simulation
+  Duration:         2,102,400 min  (4.00 yr)
+  Events logged:   10,672,495
+
+Incidents
+  Spawned:          2,035,622
+  Resolved:         2,035,581
+  Open / queued:           41  (0.0% unresolved)
+
+Response Time  (spawn → unit arrival, minutes)
+  District          N      Avg      P50      P95      Max
+  0             36963      1.7        1        1      168
+  ...
+  ALL         2035611    177.8        1      186   298558
+
+Unit Utilization  (busy time / sim duration)
+  District    Units  Avg Busy%
+  0               3       22.2
+  ...
+  ALL            74       74.1
+```
 
 ---
 

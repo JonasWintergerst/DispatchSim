@@ -12,7 +12,7 @@ use crate::routing::RoutingEngine;
 use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
-    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, Priority,
+    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, NodeId, Priority,
     SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
@@ -25,9 +25,12 @@ pub struct District {
     pub station:      Station,
     pub units:        Vec<Unit>,
     pub hexes:        Vec<Hex>,
+    /// O(1) lookup: hex_id → (road_node, spawn_profile_id).
+    hex_lookup:       HashMap<HexId, (NodeId, SpawnProfileId)>,
     /// Border hexes 8-adjacent to a different district; populated by City after construction.
     pub border_nodes: Vec<BorderNode>,
-    incidents:        Vec<Incident>,
+    /// Only active (non-resolved) incidents are kept here; resolved ones are removed immediately.
+    incidents:        HashMap<IncidentId, Incident>,
     /// Incidents waiting for a unit, stored in arbitrary order.
     /// `pop_best_pending` selects by priority so insertion order doesn't matter.
     pending_queue:    Vec<IncidentId>,
@@ -45,13 +48,17 @@ impl District {
         rng:     SmallRng,
         routing: RoutingEngine,
     ) -> Self {
+        let hex_lookup = hexes.iter()
+            .map(|h| (h.id, (h.nearest_road_node, h.spawn_profile_id.clone())))
+            .collect();
         District {
             id,
             station,
             units,
             hexes,
+            hex_lookup,
             border_nodes: Vec::new(),
-            incidents: Vec::new(),
+            incidents: HashMap::new(),
             pending_queue: Vec::new(),
             incident_counter: 0,
             rng,
@@ -99,11 +106,9 @@ impl District {
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
-        let (location, spawn_profile_id) = self
-            .hexes
-            .iter()
-            .find(|h| h.id == hex_id)
-            .map(|h| (h.nearest_road_node, h.spawn_profile_id.clone()))
+        let (location, spawn_profile_id) = self.hex_lookup
+            .get(&hex_id)
+            .map(|(node, profile)| (*node, profile.clone()))
             .expect("hex_id not found in district");
 
         let profile  = &profiles[&spawn_profile_id];
@@ -114,7 +119,7 @@ impl District {
         let incident_id = IncidentId::new(format!("{}-{}", self.id.value(), self.incident_counter));
         self.incident_counter += 1;
 
-        self.incidents.push(Incident::new(
+        self.incidents.insert(incident_id.clone(), Incident::new(
             incident_id.clone(), kind, priority, location, self.id, UnitRequirements(1), time,
         ));
 
@@ -126,7 +131,7 @@ impl District {
                 Some(idx)
             } else if let Some((idx, old_id)) = self.find_preemptable(new_rank) {
                 // Return the preempted incident to the pending queue.
-                if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == old_id) {
+                if let Some(inc) = self.incidents.get_mut(&old_id) {
                     inc.status = IncidentStatus::Open;
                 }
                 self.pending_queue.push(old_id);
@@ -137,13 +142,13 @@ impl District {
 
         if let Some(idx) = dispatch_idx {
             let from        = self.units[idx].position();
-            let route       = self.routing.route_between(from, location);
             let tt          = self.routing.travel_time(from, location) as u64;
             let arrival     = SimTime(time.0 + tt);
             let unit_id     = self.units[idx].id;
-            let dispatch_id = self.units[idx].dispatch(route, time, arrival, incident_id.clone());
+            // Route is not used by the sim loop; pass empty Vec to avoid A* cost.
+            let dispatch_id = self.units[idx].dispatch(Vec::new(), time, arrival, incident_id.clone());
 
-            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == incident_id) {
+            if let Some(inc) = self.incidents.get_mut(&incident_id) {
                 inc.status = IncidentStatus::Assigned;
             }
             out.push((
@@ -174,8 +179,7 @@ impl District {
         // Discard if the unit was reassigned after this event was scheduled.
         if self.units[idx].dispatch_id != dispatch_id { return; }
 
-        let (incident_location, priority) = self.incidents.iter()
-            .find(|i| i.id == *incident_id)
+        let (incident_location, priority) = self.incidents.get(incident_id)
             .map(|i| (Some(i.location), Some(i.priority)))
             .unwrap_or((None, None));
         match incident_location {
@@ -206,9 +210,8 @@ impl District {
         incident_id: &IncidentId,
         out: &mut Vec<(SimEvent, Event)>,
     ) {
-        if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == *incident_id) {
-            inc.resolve(time);
-        }
+        // Remove resolved incident immediately to keep the HashMap small.
+        self.incidents.remove(incident_id);
 
         let Some(unit_idx) = self.units.iter().position(|u| u.assigned_incident.as_ref() == Some(incident_id)) else {
             out.push((SimEvent::NoOp, Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: None, incident: Some(incident_id.clone()) }));
@@ -223,14 +226,13 @@ impl District {
 
         // Dispatch to a waiting incident before sending the unit home.
         if let Some(pending_id) = self.pop_best_pending() {
-            let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
+            let pending_loc = self.incidents.get(&pending_id).map(|i| i.location).unwrap();
             let from        = self.units[unit_idx].position();
-            let route       = self.routing.route_between(from, pending_loc);
             let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
-            let dispatch_id = self.units[unit_idx].dispatch(route, time, arrival, pending_id.clone());
+            let dispatch_id = self.units[unit_idx].dispatch(Vec::new(), time, arrival, pending_id.clone());
 
-            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == pending_id) {
+            if let Some(inc) = self.incidents.get_mut(&pending_id) {
                 inc.status = IncidentStatus::Assigned;
             }
             out.push((
@@ -279,14 +281,13 @@ impl District {
 
         // Immediately dispatch if something is waiting.
         if let Some(pending_id) = self.pop_best_pending() {
-            let pending_loc = self.incidents.iter().find(|i| i.id == pending_id).map(|i| i.location).unwrap();
+            let pending_loc = self.incidents.get(&pending_id).map(|i| i.location).unwrap();
             let from        = self.units[idx].position();
-            let route       = self.routing.route_between(from, pending_loc);
             let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
-            let did         = self.units[idx].dispatch(route, time, arrival, pending_id.clone());
+            let did         = self.units[idx].dispatch(Vec::new(), time, arrival, pending_id.clone());
 
-            if let Some(inc) = self.incidents.iter_mut().find(|i| i.id == pending_id) {
+            if let Some(inc) = self.incidents.get_mut(&pending_id) {
                 inc.status = IncidentStatus::Assigned;
             }
             out.push((
@@ -315,9 +316,7 @@ impl District {
             .filter(|(_, u)| u.status == UnitStatus::Dispatched)
             .filter_map(|(idx, u)| {
                 let assigned = u.assigned_incident.as_ref()?;
-                let rank = self.incidents.iter()
-                    .find(|i| i.id == *assigned)?
-                    .priority.rank();
+                let rank = self.incidents.get(assigned)?.priority.rank();
                 if rank < new_rank { Some((idx, assigned.clone(), rank)) } else { None }
             })
             .min_by_key(|(_, _, rank)| *rank)
@@ -326,18 +325,15 @@ impl District {
 
     /// Remove and return the highest-priority incident from the pending queue.
     fn pop_best_pending(&mut self) -> Option<IncidentId> {
-        // Collect (queue_index, priority_rank) for all non-resolved pending incidents.
-        let ranked: Vec<(usize, u8)> = self.pending_queue.iter()
+        // Incidents are removed from the map when resolved, so any id still in
+        // pending_queue that exists in the map is still open.
+        let best_i = self.pending_queue.iter()
             .enumerate()
             .filter_map(|(i, id)| {
-                self.incidents.iter()
-                    .find(|inc| &inc.id == id && !inc.is_resolved())
-                    .map(|inc| (i, inc.priority.rank()))
+                self.incidents.get(id).map(|inc| (i, inc.priority.rank()))
             })
-            .collect();
-
-        let best_i = ranked.into_iter().max_by_key(|(_, r)| *r).map(|(i, _)| i)?;
-        // swap_remove is O(1) and order doesn't matter since we always pick by priority.
+            .max_by_key(|(_, r)| *r)
+            .map(|(i, _)| i)?;
         Some(self.pending_queue.swap_remove(best_i))
     }
 }

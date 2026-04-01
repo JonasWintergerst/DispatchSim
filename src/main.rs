@@ -33,10 +33,12 @@ fn main() {
         cfg.city.sim.duration_minutes,
     );
 
+    let setup_start = Instant::now();
     let city = City::from_config(&cfg);
+    let setup_ms = setup_start.elapsed().as_millis();
 
     println!(
-        "City ready — {} districts, {} total units",
+        "City ready — {} districts, {} total units  [{setup_ms} ms setup]",
         city.districts.len(),
         city.districts.iter().map(|d| d.units.len()).sum::<usize>(),
     );
