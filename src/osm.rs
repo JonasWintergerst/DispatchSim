@@ -18,7 +18,7 @@ use crate::types::NodeId;
 // ---------------------------------------------------------------------------
 // Police station POI extracted from OSM.
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PoliceStation {
     pub name: String,
     pub lat:  f64,

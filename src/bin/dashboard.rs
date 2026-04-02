@@ -1,7 +1,6 @@
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -13,6 +12,13 @@ struct HexEntry {
     lat: f64,
     lon: f64,
     district_id: u32,
+}
+
+#[derive(Deserialize)]
+struct StationEntry {
+    name: String,
+    lat: f64,
+    lon: f64,
 }
 
 // ── Colour palette (16 visually distinct colours) ─────────────────────────────
@@ -69,8 +75,7 @@ fn spawn_with_live_stdout(mut cmd: Command) -> Result<RunningProcess, std::io::E
 
 struct DashboardApp {
     hexes: Vec<HexEntry>,
-    /// district_id → (lat, lon) of its station (= first hex in the district)
-    stations: HashMap<u32, (f64, f64)>,
+    stations: Vec<StationEntry>,
     lat_range: (f64, f64),
     lon_range: (f64, f64),
     /// Top-level status (idle / running / done)
@@ -85,7 +90,7 @@ impl DashboardApp {
     fn new() -> Self {
         let hexes = load_hexes();
         let (lat_range, lon_range) = bounds(&hexes);
-        let stations = station_positions(&hexes);
+        let stations = load_stations();
         Self {
             hexes,
             stations,
@@ -276,7 +281,7 @@ fn draw_hex_map(
     ui: &mut egui::Ui,
     rect: Rect,
     hexes: &[HexEntry],
-    stations: &HashMap<u32, (f64, f64)>,
+    stations: &[StationEntry],
     (lat_min, lat_max): (f64, f64),
     (lon_min, lon_max): (f64, f64),
 ) {
@@ -297,22 +302,27 @@ fn draw_hex_map(
         painter.circle_filled(Pos2::new(x, y), dot_r, district_color(hex.district_id));
     }
 
-    // Station markers — star drawn over the hex dots
-    for (&district_id, &(lat, lon)) in stations {
-        let x = inner.left() + ((lon - lon_min) / lon_span) as f32 * inner.width();
-        let y = inner.bottom() - ((lat - lat_min) / lat_span) as f32 * inner.height();
+    // Station markers
+    for station in stations {
+        let x = inner.left() + ((station.lon - lon_min) / lon_span) as f32 * inner.width();
+        let y = inner.bottom() - ((station.lat - lat_min) / lat_span) as f32 * inner.height();
         let pos = Pos2::new(x, y);
-        let color = district_color(district_id);
-        // White halo so the star is visible on any district colour
-        painter.circle_filled(pos, dot_r + 4.0, Color32::WHITE);
-        painter.circle_filled(pos, dot_r + 3.0, color);
+        painter.circle_filled(pos, dot_r + 4.0, Color32::BLACK);
+        painter.circle_filled(pos, dot_r + 3.0, Color32::from_rgb(255, 215, 0));
         painter.text(
             pos,
             egui::Align2::CENTER_CENTER,
             "★",
             egui::FontId::proportional(10.0),
-            Color32::WHITE,
+            Color32::BLACK,
         );
+        // Tooltip on hover
+        let rect = Rect::from_center_size(pos, Vec2::splat((dot_r + 4.0) * 2.0));
+        if ui.rect_contains_pointer(rect) {
+            egui::show_tooltip_at_pointer(ui.ctx(), ui.layer_id(), egui::Id::new(&station.name), |ui| {
+                ui.label(&station.name);
+            });
+        }
     }
 
     // Legend
@@ -365,13 +375,15 @@ fn load_hexes() -> Vec<HexEntry> {
     serde_json::from_str(&buf).unwrap_or_default()
 }
 
-/// Station = first hex in each district (mirrors city.rs initialisation).
-fn station_positions(hexes: &[HexEntry]) -> HashMap<u32, (f64, f64)> {
-    let mut map = HashMap::new();
-    for h in hexes {
-        map.entry(h.district_id).or_insert((h.lat, h.lon));
-    }
-    map
+fn load_stations() -> Vec<StationEntry> {
+    let path = "config/police_stations.json";
+    let mut file = match std::fs::File::open(path) {
+        Ok(f)  => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok();
+    serde_json::from_str(&buf).unwrap_or_default()
 }
 
 fn bounds(hexes: &[HexEntry]) -> ((f64, f64), (f64, f64)) {

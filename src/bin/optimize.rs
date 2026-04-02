@@ -17,10 +17,10 @@ use serde::Deserialize;
 use dispatch_sim::config::SpawnProfileConfig;
 use rayon::prelude::*;
 
-use dispatch_sim::optimizer::{self, Constraints, H3Hex, ObjectiveWeights, Problem, Solver};
+use dispatch_sim::optimizer::{self, CandidateStation, Constraints, H3Hex, ObjectiveWeights, Problem, Solver};
 use dispatch_sim::optimizer::greedy::GreedySolver;
 use dispatch_sim::optimizer::h3_grid;
-use dispatch_sim::osm::{OsmGraph, extract_admin_boundary, extract_police_stations};
+use dispatch_sim::osm::{OsmGraph, PoliceStation, extract_admin_boundary, extract_police_stations};
 
 // ---------------------------------------------------------------------------
 // Optimizer config (optimize.toml)
@@ -28,16 +28,22 @@ use dispatch_sim::osm::{OsmGraph, extract_admin_boundary, extract_police_station
 
 #[derive(Deserialize)]
 struct OptimizeConfig {
-    n_districts:         usize,
-    h3_resolution:       u8,
+    n_districts:             usize,
+    h3_resolution:           u8,
     #[allow(dead_code)]
-    area_geojson:        String, // kept for config compatibility; boundary is now extracted from OSM
-    osm_path:            String,
-    hex_output_path:     String,
-    spawn_profiles_path: String,
-    constraints:         ConstraintsConfig,
-    objective:           ObjectiveConfig,
-    solver:              SolverConfig,
+    area_geojson:            String, // kept for config compatibility; boundary is now extracted from OSM
+    osm_path:                String,
+    hex_output_path:         String,
+    spawn_profiles_path:     String,
+    /// Path to a JSON array of candidate stations [{name, lat, lon}].
+    /// Defaults to "config/police_stations.json" (written by the optimizer itself).
+    station_candidates_path: Option<String>,
+    /// Output path for districts.json (district → selected station mapping).
+    /// Defaults to "config/districts.json".
+    districts_output_path:   Option<String>,
+    constraints:             ConstraintsConfig,
+    objective:               ObjectiveConfig,
+    solver:                  SolverConfig,
 }
 
 #[derive(Deserialize)]
@@ -94,7 +100,23 @@ fn main() {
         })
     };
 
-    // 3. Extract Hamburg boundary from the OSM file (replaces the hand-drawn GeoJSON).
+    // 3. Extract police stations from OSM and write police_stations.json.
+    //    Done early so the default station_candidates_path points to a fresh file.
+    println!("Extracting police stations from OSM…");
+    let police_stations_path = "config/police_stations.json";
+    match extract_police_stations(Path::new(&cfg.osm_path)) {
+        Ok(stations) => {
+            println!("  → {} station(s) found", stations.len());
+            let json = serde_json::to_string_pretty(&stations)
+                .expect("failed to serialise police stations");
+            std::fs::write(police_stations_path, json)
+                .unwrap_or_else(|e| eprintln!("warning: could not write {police_stations_path}: {e}"));
+            println!("  → written to {police_stations_path}");
+        }
+        Err(e) => eprintln!("warning: could not extract police stations: {e}"),
+    }
+
+    // 4. Extract Hamburg boundary from the OSM file (replaces the hand-drawn GeoJSON).
     println!("Extracting Hamburg boundary from OSM: {}", cfg.osm_path);
     let polygon = extract_admin_boundary(Path::new(&cfg.osm_path)).unwrap_or_else(|e| {
         eprintln!("error extracting boundary: {e}"); process::exit(1);
@@ -115,7 +137,7 @@ fn main() {
         process::exit(1);
     }
 
-    // 4. Load OSM graph to snap hex centres to road nodes.
+    // 5. Load OSM graph to snap hex centres to road nodes.
     println!("Loading OSM graph from: {}", cfg.osm_path);
     let osm = OsmGraph::load(Path::new(&cfg.osm_path)).unwrap_or_else(|e| {
         eprintln!("error loading OSM: {e}"); process::exit(1);
@@ -146,6 +168,7 @@ fn main() {
     }).collect();
 
     // 5b. Filter hexes to those in the main road-network connected component.
+
     //     Removes isolated enclaves (e.g. Neuwerk island) that have no road
     //     connection to the main Hamburg network.
     println!("Computing main road-network component…");
@@ -159,9 +182,45 @@ fn main() {
         println!("  → Filtered {} disconnected hexes ({} remain)", removed, hexes.len());
     }
 
-    // 6. Build problem.
+    // 6. Load candidate stations and snap each to the nearest OSM road node.
+    let candidates_path = cfg.station_candidates_path
+        .as_deref()
+        .unwrap_or("config/police_stations.json");
+    println!("Loading candidate stations from: {}", candidates_path);
+    let raw_candidates: Vec<PoliceStation> = {
+        let raw = std::fs::read_to_string(candidates_path).unwrap_or_else(|e| {
+            eprintln!("error reading {candidates_path}: {e}"); process::exit(1);
+        });
+        serde_json::from_str(&raw).unwrap_or_else(|e| {
+            eprintln!("error parsing {candidates_path}: {e}"); process::exit(1);
+        })
+    };
+    println!("  → {} candidate stations loaded", raw_candidates.len());
+
+    if raw_candidates.len() < cfg.n_districts {
+        eprintln!(
+            "error: only {} candidate stations available but n_districts={} — \
+             add more candidates or reduce n_districts",
+            raw_candidates.len(), cfg.n_districts
+        );
+        process::exit(1);
+    }
+
+    let candidates: Vec<CandidateStation> = raw_candidates.iter().map(|ps| {
+        let nearest_osm_node = osm.nearest_node(ps.lat, ps.lon).value();
+        CandidateStation {
+            name:             ps.name.clone(),
+            lat:              ps.lat,
+            lon:              ps.lon,
+            nearest_osm_node,
+        }
+    }).collect();
+    println!("  → candidates snapped to OSM road network");
+
+    // 7. Build problem.
     let problem = Problem {
         hexes,
+        candidate_stations: candidates,
         n_districts: cfg.n_districts,
         constraints: Constraints {
             contiguity:         cfg.constraints.contiguity,
@@ -173,9 +232,9 @@ fn main() {
         },
     };
 
-    // 7. Select and run solver.
-    println!("Running {} p-median solver ({} districts, {} hexes)…",
-        cfg.solver.algorithm, cfg.n_districts, problem.hexes.len());
+    // 8. Select and run solver.
+    println!("Running {} p-median solver ({} districts, {} hexes, {} candidates)…",
+        cfg.solver.algorithm, cfg.n_districts, problem.hexes.len(), problem.candidate_stations.len());
 
     let solver: Box<dyn Solver> = match cfg.solver.algorithm.as_str() {
         "greedy" => Box::new(GreedySolver),
@@ -197,23 +256,8 @@ fn main() {
         println!("Workload ratio: {:.2}", max_load / mean_load);
     }
 
-    // Contiguity check: report whether any district is disconnected.
     if cfg.constraints.contiguity {
         println!("Contiguity: enforced");
-    }
-
-    // 8. Extract and write police stations.
-    println!("Extracting police stations from OSM…");
-    match extract_police_stations(Path::new(&cfg.osm_path)) {
-        Ok(stations) => {
-            println!("  → {} station(s) found", stations.len());
-            let json = serde_json::to_string_pretty(&stations)
-                .expect("failed to serialise police stations");
-            std::fs::write("config/police_stations.json", json)
-                .unwrap_or_else(|e| eprintln!("warning: could not write police_stations.json: {e}"));
-            println!("  → written to config/police_stations.json");
-        }
-        Err(e) => eprintln!("warning: could not extract police stations: {e}"),
     }
 
     // 9. Write hexes.json.
@@ -223,7 +267,18 @@ fn main() {
             eprintln!("error writing {}: {e}", cfg.hex_output_path);
             process::exit(1);
         });
-
     println!("Written {} ({} entries)", cfg.hex_output_path, problem.hexes.len());
+
+    // 10. Write districts.json.
+    let districts_path = cfg.districts_output_path
+        .as_deref()
+        .unwrap_or("config/districts.json");
+    optimizer::write_districts_json(&problem.candidate_stations, &solution, Path::new(districts_path))
+        .unwrap_or_else(|e| {
+            eprintln!("error writing {districts_path}: {e}");
+            process::exit(1);
+        });
+    println!("Written {districts_path} ({} entries)", solution.station_indices.len());
+
     println!("Run `cargo run -- config/city.toml` to simulate the optimized layout.");
 }

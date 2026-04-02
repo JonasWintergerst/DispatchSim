@@ -1,6 +1,6 @@
 # dispatch_sim
 
-A discrete-event simulation of emergency services dispatch, paired with a mathematical district optimizer. Model a city, co-optimize station locations and district boundaries, then evaluate the layout under realistic incident demand.
+A discrete-event simulation of emergency services dispatch, paired with a mathematical district optimizer. Model a city, optimize station-to-district assignments using real OSM police station data, then evaluate the layout under realistic incident demand.
 
 Built in Rust. Uses real OpenStreetMap road data and H3 geospatial indexing.
 
@@ -8,16 +8,18 @@ Built in Rust. Uses real OpenStreetMap road data and H3 geospatial indexing.
 
 ## What it does
 
-**Optimizer** (`optimize` binary) solves a [p-median facility location](https://en.wikipedia.org/wiki/Facility_location_problem) problem over real H3 hex cells derived from a GeoJSON area boundary:
+**Optimizer** (`optimize` binary) solves a [p-median facility location](https://en.wikipedia.org/wiki/Facility_location_problem) problem over real H3 hex cells, using real police stations extracted from OSM as the candidate facility set:
 
-- Generates ~7 500 H3 cells at ~174 m resolution covering the configured area
-- Snaps each cell centre to its nearest OSM road node (R-tree, O(log n))
-- Runs a greedy p-median solver to co-optimize station positions and hex-to-district assignments, minimizing weighted travel time
+- Extracts real police station locations from the OSM PBF and writes them to `config/police_stations.json`
+- Generates ~7 500 H3 cells at ~174 m resolution covering Hamburg
+- Snaps each cell centre and each candidate station to its nearest OSM road node (R-tree, O(log n))
+- Runs a greedy p-median solver to select p stations from the candidate set and assign hexes to the nearest selected station, minimizing weighted travel time
 - Enforces contiguity (each district is a single connected region) and workload balance constraints
-- Writes `config/hexes.json` consumed by the simulator
+- Writes `config/hexes.json` (hex → district assignment) and `config/districts.json` (district → selected station)
 
 **Simulator** (`dispatch_sim` binary) runs a parallel discrete-event simulation over the optimized layout:
 
+- Reads station locations from `config/districts.json` — units home to real, OSM-snapped station nodes
 - Units cycle through `Idle → Dispatched → OnScene → Returning → Idle`
 - Priority dispatch with preemption (Priority A > B > C)
 - Incident demand driven by per-hex Poisson processes with hour-of-day, day-of-week, and season multipliers calibrated to German/EU policing benchmarks (~300 calls/day for a city of 300 000)
@@ -35,35 +37,54 @@ src/
 ├── bin/
 │   └── optimize.rs          # optimize binary entry point
 ├── optimizer/
-│   ├── mod.rs               # Solver trait, Problem/Solution types, hexes.json writer
-│   ├── greedy.rs            # Greedy p-median solver with contiguity + workload repair
-│   └── h3_grid.rs           # H3 cell generation from GeoJSON polygon (BFS)
+│   ├── mod.rs               # Solver trait, Problem/Solution/CandidateStation types, JSON writers
+│   ├── greedy.rs            # Greedy p-median solver (candidate-based + hex fallback)
+│   └── h3_grid.rs           # H3 cell generation from polygon (BFS)
 ├── city.rs                  # Event heap, districts, clock, SQLite log
 ├── district.rs              # Per-district event processing (runs in parallel)
 ├── event_queue.rs           # SimEvent enum + heap ordering
 ├── event_log.rs             # SQLite append log
 ├── routing.rs               # RoadGraph (petgraph), RoutingEngine, Dijkstra travel matrix
-├── osm.rs                   # OSM PBF parser → RoadGraph + R-tree for nearest-node
+├── osm.rs                   # OSM PBF parser → RoadGraph + R-tree + police station extraction
 ├── spawner.rs               # Exponential inter-arrival + SpawnProfile scaling
 ├── hex.rs                   # Hex struct (H3 index, lat/lon, district, OSM node)
 ├── unit.rs                  # Unit state machine
 ├── incident.rs              # Incident record
 ├── station.rs               # Station struct
 ├── clock.rs                 # SimClock (elapsed minutes → hour/day/season)
-├── config.rs                # TOML + JSON config loading
+├── config.rs                # TOML + JSON config loading (city.toml, hexes.json, districts.json)
 ├── report.rs                # Terminal summary report from SQLite
 ├── geo_utils.rs             # Haversine distance
 └── types.rs                 # Newtype IDs (UnitId, IncidentId, DistrictId, NodeId, …)
 ```
 
+### Data flow
+
+```
+OSM PBF
+  ├─→ extract_police_stations()  →  config/police_stations.json  (candidate set)
+  ├─→ extract_admin_boundary()   →  Hamburg polygon
+  └─→ OsmGraph (road network)
+
+optimizer (p-median):
+  demand:     H3 hexes (lat/lon, spawn_rate)
+  facilities: candidate stations snapped to OSM nodes
+  output:     config/hexes.json      (hex → district_id)
+              config/districts.json  (district_id → selected station + OSM node)
+
+simulator:
+  reads hexes.json        (incident spawning, district assignment)
+  reads districts.json    (station location → unit home node)
+```
+
 ### Event flow (per district, per tick)
 
 ```
-IncidentSpawn  →  dispatch best idle/returning/preemptable unit  →  UnitArrival
-UnitArrival    →  unit OnScene, sample duration                  →  IncidentResolve
-IncidentResolve→  unit returns or takes next pending incident    →  UnitReturn / UnitArrival
-UnitReturn     →  unit Idle, drain pending queue
-ShiftChange    →  log shift boundary, reschedule +480 min
+IncidentSpawn   →  dispatch best idle/returning/preemptable unit  →  UnitArrival
+UnitArrival     →  unit OnScene, sample duration                  →  IncidentResolve
+IncidentResolve →  unit returns or takes next pending incident    →  UnitReturn / UnitArrival
+UnitReturn      →  unit Idle, drain pending queue
+ShiftChange     →  log shift boundary, reschedule +480 min
 ```
 
 Stale events (unit reassigned between scheduling and firing) are detected by a `dispatch_id` counter and silently dropped — no heap modification needed.
@@ -81,11 +102,8 @@ Measured on AMD Ryzen 5 2600 (6 cores, 3.4 GHz), 16 GB RAM, Windows 11 — relea
 | Peak memory | **~220 MB** |
 
 ```bash
-# Reproduce these numbers
 cargo build --release
-
-cargo run --release --bin optimize -- config/optimize.toml
-
+cargo run --release --bin optimize   -- config/optimize.toml
 cargo run --release --bin dispatch_sim -- config/city.toml
 ```
 
@@ -96,7 +114,7 @@ cargo run --release --bin dispatch_sim -- config/city.toml
 ### Prerequisites
 
 - Rust (stable, 2021 edition)
-- Hamburg OSM data (for the optimizer): download `hamburg-latest.osm.pbf` from [Geofabrik](https://download.geofabrik.de/europe/germany/hamburg.html) and place it at `config/hamburg-latest.osm.pbf`
+- Hamburg OSM data: download `hamburg-latest.osm.pbf` from [Geofabrik](https://download.geofabrik.de/europe/germany/hamburg.html) and place it at `config/hamburg-latest.osm.pbf`
 
 ### Build
 
@@ -108,6 +126,7 @@ cargo build --release
 
 ```bash
 # Step 1 — optimize district layout (requires OSM PBF)
+#   Writes config/police_stations.json, config/hexes.json, config/districts.json
 cargo run --bin optimize -- config/optimize.toml
 
 # Step 2 — simulate
@@ -130,11 +149,18 @@ cargo test
 ### `config/optimize.toml`
 
 ```toml
-n_districts     = 7
-h3_resolution   = 9          # resolution 9 ≈ 174 m edge, ~7 500 hexes for Hamburg
-area_geojson    = "config/hamburg.geojson"
-osm_path        = "config/hamburg-latest.osm.pbf"
-hex_output_path = "config/hexes.json"
+n_districts             = 24
+h3_resolution           = 9          # resolution 9 ≈ 174 m edge, ~7 500 hexes for Hamburg
+osm_path                = "config/hamburg-latest.osm.pbf"
+hex_output_path         = "config/hexes.json"
+
+# Station candidates for the p-median solver.
+# Defaults to police_stations.json (extracted from OSM by the optimizer itself).
+# Supply a custom file with additional candidate locations to expand the search space.
+station_candidates_path = "config/police_stations.json"
+
+# Output path for the district → station mapping consumed by the simulator.
+districts_output_path   = "config/districts.json"
 
 [constraints]
 contiguity         = true
@@ -145,14 +171,24 @@ travel_time_weight      = 1.0
 workload_balance_weight = 0.2
 
 [solver]
-algorithm = "greedy"         # "greedy" | "simulated_annealing" (SA not yet implemented)
+algorithm = "greedy"
 ```
 
 ### `config/city.toml`
 
-Defines districts (id, station, unit count), spawn profiles (λ, hour/weekday/season multipliers, incident type weights), and simulation parameters (duration, RNG seed, OSM path for routing).
+Defines districts (id, name, unit count), spawn profiles (λ, hour/weekday/season multipliers, incident type weights), and simulation parameters (duration, RNG seed, OSM path for routing).
 
-The scenario is calibrated to a ~300 000-resident European city running a police-only dispatch model (~300 calls/day, 23 units across 7 districts, ~38% utilisation).
+Station names and locations are **not** defined here — they come from `config/districts.json` written by the optimizer.
+
+```toml
+hex_grid_path  = "config/hexes.json"
+districts_path = "config/districts.json"
+
+[[districts]]
+id         = 0
+name       = "PK 11"
+unit_count = 3
+```
 
 ### `config/hexes.json`
 
@@ -171,19 +207,41 @@ Flat JSON array produced by the optimizer — one entry per H3 cell:
 ]
 ```
 
+### `config/districts.json`
+
+Produced by the optimizer — one entry per district, mapping it to the selected station:
+
+```json
+[
+  {
+    "district_id": 0,
+    "station_name": "Polizeikommissariat 14",
+    "station_lat": 53.5547,
+    "station_lon": 9.9845,
+    "station_osm_node": 12345
+  }
+]
+```
+
+### `config/police_stations.json`
+
+Extracted from the OSM PBF by the optimizer on each run. Used as the default candidate set for the p-median solver. Can be replaced with a custom file (see `station_candidates_path` in `optimize.toml`) to add or change candidate locations.
+
 ---
 
 ## Optimizer algorithm
 
-The greedy p-median solver runs in O(p × n²) time:
+The greedy p-median solver selects p stations from the candidate set in O(p × m × n) time (m candidates, n hexes):
 
-1. **Distance matrix** — n × n haversine distances, computed in parallel (Rayon)
-2. **Greedy station selection** — iteratively pick the candidate that maximally reduces weighted travel cost; ties broken by spawn-rate weighting
-3. **Voronoi assignment** — each hex goes to its nearest station
-4. **Contiguity repair** — BFS from each station; disconnected hexes are reassigned to the nearest adjacent district
+1. **Distance matrix** — m × n haversine distances from each candidate to each hex, computed in parallel (Rayon)
+2. **Greedy station selection** — iteratively pick the candidate that maximally reduces total weighted travel cost
+3. **Voronoi assignment** — each hex goes to its nearest selected candidate
+4. **Contiguity repair** — BFS from each station's anchor hex; disconnected hexes are reassigned to the nearest adjacent district
 5. **Workload balance repair** — border-swap iteration until max/mean load ratio ≤ configured limit
 
-For resolution 9 (~7 500 hexes) the solver completes in a few seconds on a modern CPU.
+For resolution 9 (~7 500 hexes, ~24 candidates) the solver completes in a few seconds on a modern CPU.
+
+A fallback hex-based path (any hex can be a station) is used when `candidate_stations` is empty, preserving backward compatibility.
 
 ---
 
@@ -205,33 +263,6 @@ Prints a terminal summary covering:
 - **On-scene duration** — mean, P50, P95, max (arrival → resolved)
 - **Unit utilisation per district** — average, min, and max busy % per unit
 - **Incidents by hour of day** — total and per-day average across the simulation
-
-Example output (24 districts, 4 simulated years, ~300 calls/day):
-
-```
-=== dispatch_sim Analysis Report ===
-
-Simulation
-  Duration:         2,102,400 min  (4.00 yr)
-  Events logged:   10,672,495
-
-Incidents
-  Spawned:          2,035,622
-  Resolved:         2,035,581
-  Open / queued:           41  (0.0% unresolved)
-
-Response Time  (spawn → unit arrival, minutes)
-  District          N      Avg      P50      P95      Max
-  0             36963      1.7        1        1      168
-  ...
-  ALL         2035611    177.8        1      186   298558
-
-Unit Utilization  (busy time / sim duration)
-  District    Units  Avg Busy%
-  0               3       22.2
-  ...
-  ALL            74       74.1
-```
 
 ---
 

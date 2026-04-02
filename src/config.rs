@@ -17,20 +17,23 @@ use crate::types::SimType;
 
 /// Everything the sim needs before the first tick.
 pub struct LoadedConfig {
-    pub city: CityConfig,
-    pub hex_grid: HexGridConfig,
+    pub city:              CityConfig,
+    pub hex_grid:          HexGridConfig,
+    pub district_stations: DistrictStationGrid,
 }
 
 impl LoadedConfig {
-    /// Load city.toml and the hex JSON path referenced inside it.
+    /// Load city.toml, hexes.json, and districts.json.
     pub fn load(city_toml_path: &Path) -> Result<Self, ConfigError> {
-        let city = CityConfig::load(city_toml_path)?;
+        let city     = CityConfig::load(city_toml_path)?;
         let hex_path = Path::new(&city.hex_grid_path);
         let hex_grid = HexGridConfig::load(hex_path)?;
+        let dist_path = Path::new(&city.districts_path);
+        let district_stations = DistrictStationGrid::load(dist_path)?;
 
-        validate(&city, &hex_grid)?;
+        validate(&city, &hex_grid, &district_stations)?;
 
-        Ok(Self { city, hex_grid })
+        Ok(Self { city, hex_grid, district_stations })
     }
 }
 
@@ -44,6 +47,9 @@ pub struct CityConfig {
 
     /// Path to hexes.json, relative to the working directory.
     pub hex_grid_path: String,
+
+    /// Path to districts.json written by the optimizer (district → station mapping).
+    pub districts_path: String,
 
     /// One entry per district — must match district_id values in hexes.json.
     pub districts: Vec<DistrictConfig>,
@@ -74,15 +80,8 @@ pub struct SimConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct DistrictConfig {
-    pub id: u32,
-    pub name: String,
-    pub station: StationConfig,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StationConfig {
-    pub id: u32,
-    pub name: String,
+    pub id:         u32,
+    pub name:       String,
     pub unit_count: u32,
 }
 
@@ -136,10 +135,44 @@ pub struct HexConfig {
 }
 
 // ---------------------------------------------------------------------------
+// districts.json structs — written by the optimizer, read by the simulator
+// ---------------------------------------------------------------------------
+
+/// One entry in districts.json: the station selected for a district.
+#[derive(Debug, Deserialize)]
+pub struct DistrictStation {
+    pub district_id:      u32,
+    pub station_name:     String,
+    pub station_lat:      f64,
+    pub station_lon:      f64,
+    pub station_osm_node: u32,
+}
+
+/// The full district-to-station mapping as loaded from districts.json.
+pub struct DistrictStationGrid {
+    pub entries: Vec<DistrictStation>,
+}
+
+impl DistrictStationGrid {
+    fn load(path: &Path) -> Result<Self, ConfigError> {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
+        let entries: Vec<DistrictStation> =
+            serde_json::from_str(&raw).map_err(ConfigError::Json)?;
+        Ok(Self { entries })
+    }
+
+    /// Build a HashMap for O(1) lookup by district_id.
+    pub fn by_district_id(&self) -> std::collections::HashMap<u32, &DistrictStation> {
+        self.entries.iter().map(|e| (e.district_id, e)).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
 
-fn validate(city: &CityConfig, grid: &HexGridConfig) -> Result<(), ConfigError> {
+fn validate(city: &CityConfig, grid: &HexGridConfig, stations: &DistrictStationGrid) -> Result<(), ConfigError> {
     let city_district_ids: std::collections::HashSet<u32> =
         city.districts.iter().map(|d| d.id).collect();
 
@@ -161,6 +194,9 @@ fn validate(city: &CityConfig, grid: &HexGridConfig) -> Result<(), ConfigError> 
     let hex_district_ids: std::collections::HashSet<u32> =
         grid.hexes.iter().map(|h| h.district_id).collect();
 
+    let station_district_ids: std::collections::HashSet<u32> =
+        stations.entries.iter().map(|e| e.district_id).collect();
+
     for district in &city.districts {
         if !hex_district_ids.contains(&district.id) {
             return Err(ConfigError::Validation(format!(
@@ -168,21 +204,16 @@ fn validate(city: &CityConfig, grid: &HexGridConfig) -> Result<(), ConfigError> 
                 district.name, district.id
             )));
         }
-    }
-
-    let mut station_ids = std::collections::HashSet::new();
-    for district in &city.districts {
-        let sid = district.station.id;
-        if !station_ids.insert(sid) {
+        if !station_district_ids.contains(&district.id) {
             return Err(ConfigError::Validation(format!(
-                "duplicate station id {} in city.toml",
-                sid
+                "district '{}' (id {}) has no entry in districts.json — run the optimizer first",
+                district.name, district.id
             )));
         }
-        if district.station.unit_count == 0 {
+        if district.unit_count == 0 {
             return Err(ConfigError::Validation(format!(
-                "station '{}' (id {}) has unit_count = 0",
-                district.station.name, district.station.id
+                "district '{}' (id {}) has unit_count = 0",
+                district.name, district.id
             )));
         }
     }

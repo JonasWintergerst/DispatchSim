@@ -148,11 +148,13 @@ impl City {
                 rng_seed:      seed_rng.random(),
             };
             next_hex_id  += hex_count;
-            next_unit_id += d.station.unit_count;
+            next_unit_id += d.unit_count;
             s
         }).collect();
 
         // Phase B: build each district in parallel (routing engines are independent).
+        let station_lookup = cfg.district_stations.by_district_id();
+
         let mut districts: Vec<District> = cfg.city.districts
             .iter()
             .zip(setups.iter())
@@ -214,13 +216,14 @@ impl City {
                     build_h3_routing_engine(&hexes)
                 };
 
-                // Station node = first hex's road node (all hexes are snapped by here).
-                let station_node = hexes.first()
-                    .and_then(|h| h.nearest_road_node)
-                    .expect("district has no hexes — config validation should have caught this");
-                let station_id   = StationId::new(district_cfg.station.id);
+                // Station location from districts.json (real OSM-snapped station node).
+                let district_station = station_lookup
+                    .get(&district_cfg.id)
+                    .expect("no station entry in districts.json — run the optimizer first");
+                let station_node = NodeId::new(district_station.station_osm_node);
+                let station_id   = StationId::new(district_cfg.id);
 
-                let units: Vec<Unit> = (0..district_cfg.station.unit_count).map(|_| {
+                let units: Vec<Unit> = (0..district_cfg.unit_count).map(|_| {
                     let uid = UnitId::new(unit_cursor);
                     unit_cursor += 1;
                     Unit::new(uid, sim_type, station_node)
@@ -229,7 +232,7 @@ impl City {
                 let unit_ids: Vec<UnitId> = units.iter().map(|u| u.id).collect();
                 let station = Station::new(
                     station_id,
-                    district_cfg.station.name.clone(),
+                    district_station.station_name.clone(),
                     sim_type,
                     station_node,
                     unit_ids,

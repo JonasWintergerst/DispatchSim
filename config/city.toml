@@ -23,7 +23,8 @@
 #   MedicalEmergency → welfare check, mental health, assist   — ~25 %
 #   Fire             → alarm activation, assist fire brigade  — ~10 %
 
-hex_grid_path = "config/hexes.json"
+hex_grid_path  = "config/hexes.json"
+districts_path = "config/districts.json"
 
 [sim]
 tick_minutes     = 1
@@ -42,199 +43,128 @@ lon_min =  9.730
 lon_max = 10.330
 
 # ---------------------------------------------------------------------------
-# Districts + stations  (24 Polizeikommissariate, matching Hamburg's real PK count)
+# Districts  (24 Polizeikommissariate, matching Hamburg's real PK count)
+# Station names and locations come from districts.json written by the optimizer.
 # ---------------------------------------------------------------------------
 
 [[districts]]
-id   = 0
-name = "PK 11"
-[districts.station]
 id         = 0
-name       = "Station PK 11"
+name       = "PK 11"
 unit_count = 3
 
 [[districts]]
-id   = 1
-name = "PK 12"
-[districts.station]
 id         = 1
-name       = "Station PK 12"
+name       = "PK 12"
 unit_count = 3
 
 [[districts]]
-id   = 2
-name = "PK 13"
-[districts.station]
 id         = 2
-name       = "Station PK 13"
+name       = "PK 13"
 unit_count = 3
 
 [[districts]]
-id   = 3
-name = "PK 14"
-[districts.station]
 id         = 3
-name       = "Station PK 14"
+name       = "PK 14"
 unit_count = 3
 
 [[districts]]
-id   = 4
-name = "PK 15"
-[districts.station]
 id         = 4
-name       = "Station PK 15"
+name       = "PK 15"
 unit_count = 5
 
 [[districts]]
-id   = 5
-name = "PK 16"
-[districts.station]
 id         = 5
-name       = "Station PK 16"
+name       = "PK 16"
 unit_count = 3
 
 [[districts]]
-id   = 6
-name = "PK 17"
-[districts.station]
 id         = 6
-name       = "Station PK 17"
+name       = "PK 17"
 unit_count = 3
 
 [[districts]]
-id   = 7
-name = "PK 21"
-[districts.station]
 id         = 7
-name       = "Station PK 21"
+name       = "PK 21"
 unit_count = 3
 
 [[districts]]
-id   = 8
-name = "PK 22"
-[districts.station]
 id         = 8
-name       = "Station PK 22"
+name       = "PK 22"
 unit_count = 3
 
 [[districts]]
-id   = 9
-name = "PK 23"
-[districts.station]
 id         = 9
-name       = "Station PK 23"
+name       = "PK 23"
 unit_count = 3
 
 [[districts]]
-id   = 10
-name = "PK 24"
-[districts.station]
 id         = 10
-name       = "Station PK 24"
+name       = "PK 24"
 unit_count = 3
 
 [[districts]]
-id   = 11
-name = "PK 25"
-[districts.station]
 id         = 11
-name       = "Station PK 25"
+name       = "PK 25"
 unit_count = 3
 
 [[districts]]
-id   = 12
-name = "PK 26"
-[districts.station]
 id         = 12
-name       = "Station PK 26"
+name       = "PK 26"
 unit_count = 3
 
 [[districts]]
-id   = 13
-name = "PK 27"
-[districts.station]
 id         = 13
-name       = "Station PK 27"
+name       = "PK 27"
 unit_count = 3
 
 [[districts]]
-id   = 14
-name = "PK 31"
-[districts.station]
 id         = 14
-name       = "Station PK 31"
+name       = "PK 31"
 unit_count = 3
 
 [[districts]]
-id   = 15
-name = "PK 32"
-[districts.station]
 id         = 15
-name       = "Station PK 32"
+name       = "PK 32"
 unit_count = 3
 
 [[districts]]
-id   = 16
-name = "PK 33"
-[districts.station]
 id         = 16
-name       = "Station PK 33"
+name       = "PK 33"
 unit_count = 3
 
 [[districts]]
-id   = 17
-name = "PK 34"
-[districts.station]
 id         = 17
-name       = "Station PK 34"
+name       = "PK 34"
 unit_count = 3
 
 [[districts]]
-id   = 18
-name = "PK 35"
-[districts.station]
 id         = 18
-name       = "Station PK 35"
+name       = "PK 35"
 unit_count = 3
 
 [[districts]]
-id   = 19
-name = "PK 36"
-[districts.station]
 id         = 19
-name       = "Station PK 36"
+name       = "PK 36"
 unit_count = 3
 
 [[districts]]
-id   = 20
-name = "PK 41"
-[districts.station]
 id         = 20
-name       = "Station PK 41"
+name       = "PK 41"
 unit_count = 3
 
 [[districts]]
-id   = 21
-name = "PK 42"
-[districts.station]
 id         = 21
-name       = "Station PK 42"
+name       = "PK 42"
 unit_count = 3
 
 [[districts]]
-id   = 22
-name = "PK 43"
-[districts.station]
 id         = 22
-name       = "Station PK 43"
+name       = "PK 43"
 unit_count = 3
 
 [[districts]]
-id   = 23
-name = "PK 46"
-[districts.station]
 id         = 23
-name       = "Station PK 46"
+name       = "PK 46"
 unit_count = 3
 
 # ---------------------------------------------------------------------------

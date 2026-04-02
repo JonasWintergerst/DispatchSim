@@ -18,7 +18,7 @@ use h3o::CellIndex;
 use rayon::prelude::*;
 
 use crate::geo_utils::haversine_m;
-use super::{H3Hex, OptimizerError, Problem, Solution};
+use super::{CandidateStation, H3Hex, OptimizerError, Problem, Solution};
 
 // Precomputed H3 adjacency list: adj[i] = indices of hex neighbours within the hex set.
 type Adj = Vec<Vec<usize>>;
@@ -36,6 +36,13 @@ impl super::Solver for GreedySolver {
                 "fewer hexes ({n}) than districts ({p})"
             )));
         }
+
+        // Dispatch to candidate-based or hex-based path.
+        if !problem.candidate_stations.is_empty() {
+            return solve_candidate_based(hexes, &problem.candidate_stations, n, p, &problem.constraints);
+        }
+
+        // --- Hex-based fallback (any hex can be a station) ---
 
         // 1. Distance matrix — flat row-major, dist[i*n + j] = haversine(i, j).
         println!("  Building {}×{} distance matrix…", n, n);
@@ -90,14 +97,17 @@ impl super::Solver for GreedySolver {
         let cell_map = build_cell_map(hexes);
         let adj      = build_adjacency(hexes, &cell_map);
 
+        // In the hex-based path the station hex IS the anchor hex.
+        let anchors = station_indices.clone();
+
         // 4. Contiguity repair.
         if problem.constraints.contiguity {
-            repair_contiguity(&mut assignments, &adj, &station_indices, p);
+            repair_contiguity(&mut assignments, &adj, &anchors, p);
         }
 
         // 5. Workload balance repair.
         if let Some(ratio) = problem.constraints.max_workload_ratio {
-            repair_workload(hexes, &mut assignments, &adj, &station_indices, p, ratio);
+            repair_workload(hexes, &mut assignments, &adj, &anchors, p, ratio);
         }
 
         // 6. Build solution.
@@ -106,7 +116,162 @@ impl super::Solver for GreedySolver {
 }
 
 // ---------------------------------------------------------------------------
-// Gain computation
+// Candidate-based p-median path
+// ---------------------------------------------------------------------------
+
+fn solve_candidate_based(
+    hexes:       &[H3Hex],
+    candidates:  &[CandidateStation],
+    n:           usize,
+    p:           usize,
+    constraints: &super::Constraints,
+) -> Result<Solution, super::OptimizerError> {
+    let m = candidates.len();
+
+    if m < p {
+        return Err(super::OptimizerError(format!(
+            "fewer candidate stations ({m}) than districts ({p})"
+        )));
+    }
+
+    // 1. Build m×n distance matrix: dist_cs[c * n + h] = haversine(candidate_c, hex_h).
+    println!("  Building {}×{} candidate-to-hex distance matrix…", m, n);
+    let dist_cs: Vec<f64> = (0..m)
+        .into_par_iter()
+        .flat_map(|c| {
+            (0..n)
+                .map(|h| haversine_m(candidates[c].lat, candidates[c].lon, hexes[h].lat, hexes[h].lon))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // 2. Greedy station selection over candidate set.
+    let mut cost: Vec<f64> = hexes.iter().map(|h| h.spawn_rate * f64::MAX / 2.0).collect();
+    let mut station_indices: Vec<usize> = Vec::with_capacity(p); // indices into candidates[]
+
+    for round in 0..p {
+        let best = (0..m).into_par_iter().max_by(|&c1, &c2| {
+            let g1 = gain_of_candidate(&cost, hexes, &dist_cs, n, c1);
+            let g2 = gain_of_candidate(&cost, hexes, &dist_cs, n, c2);
+            g1.partial_cmp(&g2).unwrap_or(std::cmp::Ordering::Equal)
+        }).unwrap();
+
+        station_indices.push(best);
+
+        for h in 0..n {
+            let new_cost = hexes[h].spawn_rate * dist_cs[best * n + h];
+            if new_cost < cost[h] { cost[h] = new_cost; }
+        }
+
+        let total_obj: f64 = cost.iter().sum();
+        println!("  Station {}/{}: '{}' selected — objective {:.1}",
+            round + 1, p, candidates[best].name, total_obj);
+    }
+
+    // 3. Voronoi assignment: each hex → nearest selected candidate.
+    let mut assignments: Vec<usize> = (0..n)
+        .into_par_iter()
+        .map(|h| {
+            station_indices.iter().copied().enumerate()
+                .min_by(|&(_, c1), &(_, c2)| {
+                    dist_cs[c1 * n + h].partial_cmp(&dist_cs[c2 * n + h]).unwrap()
+                })
+                .map(|(district, _)| district)
+                .unwrap()
+        })
+        .collect();
+
+    // Precompute adjacency list.
+    let cell_map = build_cell_map(hexes);
+    let adj      = build_adjacency(hexes, &cell_map);
+
+    // Anchor hex per district = hex in the district closest to its selected candidate station.
+    let anchors = compute_anchor_hexes(hexes, &assignments, &station_indices, candidates, n, p);
+
+    // 4. Contiguity repair.
+    if constraints.contiguity {
+        repair_contiguity(&mut assignments, &adj, &anchors, p);
+    }
+
+    // 5. Workload balance repair.
+    if let Some(ratio) = constraints.max_workload_ratio {
+        repair_workload(hexes, &mut assignments, &adj, &anchors, p, ratio);
+    }
+
+    // 6. Build solution.
+    build_solution_candidate(hexes, assignments, station_indices, &dist_cs, n, p)
+}
+
+fn gain_of_candidate(
+    cost:    &[f64],
+    hexes:   &[H3Hex],
+    dist_cs: &[f64],
+    n:       usize,
+    c:       usize,
+) -> f64 {
+    (0..n).map(|h| {
+        let new_cost = hexes[h].spawn_rate * dist_cs[c * n + h];
+        (cost[h] - new_cost).max(0.0)
+    }).sum()
+}
+
+/// For each district, find the hex closest to its selected candidate station.
+/// Used as the BFS anchor for contiguity / workload repair.
+fn compute_anchor_hexes(
+    hexes:           &[H3Hex],
+    assigns:         &[usize],
+    station_indices: &[usize],
+    candidates:      &[CandidateStation],
+    n:               usize,
+    p:               usize,
+) -> Vec<usize> {
+    let mut anchors   = vec![0usize; p];
+    let mut min_dists = vec![f64::MAX; p];
+
+    for h in 0..n {
+        let d  = assigns[h];
+        let ci = station_indices[d];
+        let dist = haversine_m(candidates[ci].lat, candidates[ci].lon, hexes[h].lat, hexes[h].lon);
+        if dist < min_dists[d] {
+            min_dists[d] = dist;
+            anchors[d]   = h;
+        }
+    }
+    anchors
+}
+
+fn build_solution_candidate(
+    hexes:           &[H3Hex],
+    assigns:         Vec<usize>,
+    station_indices: Vec<usize>,
+    dist_cs:         &[f64],
+    n:               usize,
+    p:               usize,
+) -> Result<Solution, super::OptimizerError> {
+    let objective: f64 = (0..n).map(|h| {
+        hexes[h].spawn_rate * dist_cs[station_indices[assigns[h]] * n + h]
+    }).sum();
+
+    let loads = district_loads(hexes, &assigns, p);
+
+    let mean = loads.iter().sum::<f64>() / p as f64;
+    let max  = loads.iter().cloned().fold(f64::MIN, f64::max);
+    println!(
+        "  Workload ratio: {:.2}  (max {:.4}/min, mean {:.4}/min)",
+        if mean > 0.0 { max / mean } else { 0.0 },
+        max, mean
+    );
+
+    Ok(Solution {
+        station_indices,
+        assignments: assigns,
+        objective,
+        district_loads: loads,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Gain computation (hex-based fallback)
 // ---------------------------------------------------------------------------
 
 fn gain_of(
@@ -127,15 +292,15 @@ fn gain_of(
 // ---------------------------------------------------------------------------
 
 fn repair_contiguity(
-    assigns:  &mut Vec<usize>,
-    adj:      &Adj,
-    stations: &[usize],
-    p:        usize,
+    assigns: &mut Vec<usize>,
+    adj:     &Adj,
+    anchors: &[usize],
+    p:       usize,
 ) {
     let n = assigns.len();
 
     for d in 0..p {
-        let start = stations[d];
+        let start = anchors[d];
 
         // BFS from station hex within this district.
         let mut reachable: HashSet<usize> = HashSet::new();
@@ -167,12 +332,12 @@ fn repair_contiguity(
 // ---------------------------------------------------------------------------
 
 fn repair_workload(
-    hexes:    &[H3Hex],
-    assigns:  &mut Vec<usize>,
-    adj:      &Adj,
-    stations: &[usize],
-    p:        usize,
-    limit:    f64,
+    hexes:   &[H3Hex],
+    assigns: &mut Vec<usize>,
+    adj:     &Adj,
+    anchors: &[usize],
+    p:       usize,
+    limit:   f64,
 ) {
     let n = hexes.len();
 
@@ -196,12 +361,12 @@ fn repair_workload(
         let mut swapped = false;
         for i in 0..n {
             if assigns[i] != over  { continue; }
-            if i == stations[over] { continue; } // never move station hex
+            if i == anchors[over]  { continue; } // never move anchor hex
 
             let adj_to_under = adj[i].iter().any(|&j| assigns[j] == under);
             if !adj_to_under { continue; }
 
-            if bfs_connected_without(assigns, adj, stations[over], i, over) {
+            if bfs_connected_without(assigns, adj, anchors[over], i, over) {
                 assigns[i] = under;
                 swapped = true;
                 break;
@@ -239,10 +404,10 @@ fn build_solution(
     );
 
     Ok(Solution {
-        station_hex_indices: stations,
-        assignments:         assigns,
+        station_indices: stations,
+        assignments:     assigns,
         objective,
-        district_loads:      loads,
+        district_loads:  loads,
     })
 }
 
@@ -315,6 +480,7 @@ mod tests {
     fn unconstrained_problem(hexes: Vec<H3Hex>, p: usize) -> Problem {
         Problem {
             hexes,
+            candidate_stations: vec![],
             n_districts: p,
             constraints: Constraints { contiguity: false, max_workload_ratio: None },
             objective:   ObjectiveWeights { travel_time: 1.0, workload_balance: 0.0 },
