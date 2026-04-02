@@ -50,9 +50,8 @@ pub struct District {
     pub border_nodes: Vec<BorderNode>,
     /// Only active (non-resolved) incidents are kept here; resolved ones are removed immediately.
     incidents:        HashMap<IncidentId, Incident>,
-    /// Incidents waiting for a unit, stored in arbitrary order.
-    /// `pop_best_pending` selects by priority so insertion order doesn't matter.
-    pending_queue:    Vec<IncidentId>,
+    /// Incidents waiting for a unit, ordered by priority (highest first).
+    pending_queue:    BinaryHeap<PendingIncident>,
     incident_counter: u32,
     rng:              SmallRng,
     routing:          RoutingEngine,
@@ -68,7 +67,7 @@ impl District {
         routing: RoutingEngine,
     ) -> Self {
         let hex_lookup = hexes.iter()
-            .map(|h| (h.id, (h.nearest_road_node, h.spawn_profile_id.clone())))
+            .map(|h| (h.id, (h.node_id(), h.spawn_profile_id.clone())))
             .collect();
         District {
             id,
@@ -78,7 +77,7 @@ impl District {
             hex_lookup,
             border_nodes: Vec::new(),
             incidents: HashMap::new(),
-            pending_queue: Vec::new(),
+            pending_queue: BinaryHeap::new(),
             incident_counter: 0,
             rng,
             routing,
@@ -150,10 +149,11 @@ impl District {
                 Some(idx)
             } else if let Some((idx, old_id)) = self.find_preemptable(new_rank) {
                 // Return the preempted incident to the pending queue.
+                let old_rank = self.incidents.get(&old_id).map(|i| i.priority.rank()).unwrap_or(0);
                 if let Some(inc) = self.incidents.get_mut(&old_id) {
                     inc.status = IncidentStatus::Open;
                 }
-                self.pending_queue.push(old_id);
+                self.pending_queue.push(PendingIncident { rank: old_rank, id: old_id });
                 Some(idx)
             } else {
                 None
@@ -175,7 +175,7 @@ impl District {
                 Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()) },
             ));
         } else {
-            self.pending_queue.push(incident_id.clone());
+            self.pending_queue.push(PendingIncident { rank: new_rank, id: incident_id.clone() });
         }
 
         let next = next_spawn_time(time, &spawn_profile_id, profiles, &mut self.rng);
@@ -245,7 +245,7 @@ impl District {
 
         // Dispatch to a waiting incident before sending the unit home.
         if let Some(pending_id) = self.pop_best_pending() {
-            let pending_loc = self.incidents.get(&pending_id).map(|i| i.location).unwrap();
+            let pending_loc = self.incidents[&pending_id].location;
             let from        = self.units[unit_idx].position();
             let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
@@ -300,7 +300,7 @@ impl District {
 
         // Immediately dispatch if something is waiting.
         if let Some(pending_id) = self.pop_best_pending() {
-            let pending_loc = self.incidents.get(&pending_id).map(|i| i.location).unwrap();
+            let pending_loc = self.incidents[&pending_id].location;
             let from        = self.units[idx].position();
             let tt          = self.routing.travel_time(from, pending_loc) as u64;
             let arrival     = SimTime(time.0 + tt);
@@ -343,17 +343,15 @@ impl District {
     }
 
     /// Remove and return the highest-priority incident from the pending queue.
+    /// Skips stale entries whose incidents were already resolved and removed from the map.
     fn pop_best_pending(&mut self) -> Option<IncidentId> {
-        // Incidents are removed from the map when resolved, so any id still in
-        // pending_queue that exists in the map is still open.
-        let best_i = self.pending_queue.iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                self.incidents.get(id).map(|inc| (i, inc.priority.rank()))
-            })
-            .max_by_key(|(_, r)| *r)
-            .map(|(i, _)| i)?;
-        Some(self.pending_queue.swap_remove(best_i))
+        while let Some(pending) = self.pending_queue.pop() {
+            if self.incidents.contains_key(&pending.id) {
+                return Some(pending.id);
+            }
+            // Stale entry — incident was resolved while queued; discard and continue.
+        }
+        None
     }
 }
 

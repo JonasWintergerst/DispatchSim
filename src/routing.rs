@@ -12,6 +12,7 @@ use petgraph::algo::{astar, dijkstra};
 use petgraph::graph::{Graph, NodeIndex};
 use rayon::prelude::*;
 
+use crate::geo_utils::haversine_m;
 use crate::hex::HexCoord;
 use crate::types::NodeId;
 
@@ -113,9 +114,35 @@ impl RoutingEngine {
     }
 
     /// Travel time in simulated minutes between two nodes. O(1) lookup.
-    /// Returns 1 as a safe default if either node is unknown.
+    /// Falls back to a haversine estimate at 30 km/h when the pair is not
+    /// in the precomputed table (e.g. disconnected subgraph or missing anchor).
     pub fn travel_time(&self, from: NodeId, to: NodeId) -> u32 {
-        self.times.get(&(from, to)).copied().unwrap_or(1)
+        if let Some(&t) = self.times.get(&(from, to)) {
+            return t;
+        }
+        self.haversine_fallback(from, to)
+    }
+
+    /// Haversine estimate at 30 km/h between two node positions.
+    /// Falls back to 1 min only if one of the nodes is not in the graph at all.
+    fn haversine_fallback(&self, from: NodeId, to: NodeId) -> u32 {
+        const SPEED_M_PER_MIN: f64 = 30_000.0 / 60.0; // 30 km/h
+        let fp = self.node_index.get(&from).map(|&nx| self.graph[nx].position);
+        let tp = self.node_index.get(&to).map(|&nx| self.graph[nx].position);
+        match (fp, tp) {
+            (Some(fp), Some(tp)) => {
+                // Node positions are stored as Point(lon, lat) in the geo crate.
+                let dist_m = haversine_m(fp.y(), fp.x(), tp.y(), tp.x());
+                ((dist_m / SPEED_M_PER_MIN) as u32).max(1)
+            }
+            _ => {
+                eprintln!(
+                    "routing: travel_time({:?} → {:?}) node not in graph; using 1 min",
+                    from, to
+                );
+                1
+            }
+        }
     }
 
     /// Shortest path between two nodes; lazily computed and cached.
@@ -140,6 +167,7 @@ impl RoutingEngine {
         let (Some(&from_nx), Some(&to_nx)) =
             (self.node_index.get(&from), self.node_index.get(&to))
         else {
+            eprintln!("routing: compute_route({:?} → {:?}) node not in graph", from, to);
             return vec![from, to];
         };
 
