@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use dispatch_sim::optimizer::{self, Constraints, H3Hex, ObjectiveWeights, Problem, Solver};
 use dispatch_sim::optimizer::greedy::GreedySolver;
 use dispatch_sim::optimizer::h3_grid;
-use dispatch_sim::osm::OsmGraph;
+use dispatch_sim::osm::{OsmGraph, extract_admin_boundary, extract_police_stations};
 
 // ---------------------------------------------------------------------------
 // Optimizer config (optimize.toml)
@@ -30,7 +30,8 @@ use dispatch_sim::osm::OsmGraph;
 struct OptimizeConfig {
     n_districts:         usize,
     h3_resolution:       u8,
-    area_geojson:        String,
+    #[allow(dead_code)]
+    area_geojson:        String, // kept for config compatibility; boundary is now extracted from OSM
     osm_path:            String,
     hex_output_path:     String,
     spawn_profiles_path: String,
@@ -93,11 +94,12 @@ fn main() {
         })
     };
 
-    // 3. Generate H3 cells for the configured area.
-    println!("Loading area polygon from: {}", cfg.area_geojson);
-    let polygon = h3_grid::load_polygon(Path::new(&cfg.area_geojson)).unwrap_or_else(|e| {
-        eprintln!("error loading GeoJSON: {e}"); process::exit(1);
+    // 3. Extract Hamburg boundary from the OSM file (replaces the hand-drawn GeoJSON).
+    println!("Extracting Hamburg boundary from OSM: {}", cfg.osm_path);
+    let polygon = extract_admin_boundary(Path::new(&cfg.osm_path)).unwrap_or_else(|e| {
+        eprintln!("error extracting boundary: {e}"); process::exit(1);
     });
+    println!("  → boundary extracted (Neuwerk island excluded)");
 
     let resolution = Resolution::try_from(cfg.h3_resolution).unwrap_or_else(|_| {
         eprintln!("invalid h3_resolution {} (must be 0–15)", cfg.h3_resolution);
@@ -200,7 +202,21 @@ fn main() {
         println!("Contiguity: enforced");
     }
 
-    // 8. Write hexes.json.
+    // 8. Extract and write police stations.
+    println!("Extracting police stations from OSM…");
+    match extract_police_stations(Path::new(&cfg.osm_path)) {
+        Ok(stations) => {
+            println!("  → {} station(s) found", stations.len());
+            let json = serde_json::to_string_pretty(&stations)
+                .expect("failed to serialise police stations");
+            std::fs::write("config/police_stations.json", json)
+                .unwrap_or_else(|e| eprintln!("warning: could not write police_stations.json: {e}"));
+            println!("  → written to config/police_stations.json");
+        }
+        Err(e) => eprintln!("warning: could not extract police stations: {e}"),
+    }
+
+    // 9. Write hexes.json.
     let output_path = Path::new(&cfg.hex_output_path);
     optimizer::write_hexes_json(&problem.hexes, &solution, output_path)
         .unwrap_or_else(|e| {

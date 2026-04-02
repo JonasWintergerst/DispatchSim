@@ -203,9 +203,7 @@ impl City {
                     // Re-snap any hex whose OSM node wasn't pre-computed by the optimizer.
                     let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
                     for hex in hexes.iter_mut() {
-                        if hex.nearest_road_node.is_none() {
-                            hex.nearest_road_node = Some(osm_graph.nearest_node(hex.lat, hex.lon));
-                        }
+                        hex.nearest_road_node = Some(osm_graph.nearest_node(hex.lat, hex.lon));
                         anchors.push(hex.nearest_road_node.unwrap());
                     }
                     anchors.sort();

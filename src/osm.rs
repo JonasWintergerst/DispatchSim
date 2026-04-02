@@ -6,14 +6,24 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use geo::Point;
-use osmpbf::{Element, ElementReader};
+use geo::{BoundingRect, Coord, LineString, Point, Polygon};
+use osmpbf::{Element, ElementReader, RelMemberType};
 use petgraph::graph::NodeIndex;
 use rstar::{RTree, RTreeObject, AABB, PointDistance};
 
 use crate::geo_utils::haversine_m;
 use crate::routing::{Edge, Node, RoadGraph};
 use crate::types::NodeId;
+
+// ---------------------------------------------------------------------------
+// Police station POI extracted from OSM.
+
+#[derive(serde::Serialize)]
+pub struct PoliceStation {
+    pub name: String,
+    pub lat:  f64,
+    pub lon:  f64,
+}
 
 // ---------------------------------------------------------------------------
 // R-tree entry for O(log n) nearest-node queries.
@@ -91,6 +101,8 @@ impl OsmGraph {
         let mut node_positions: Vec<(NodeId, f64, f64)> = Vec::with_capacity(relevant.len());
         let mut next_id: u32 = 0;
 
+        let mut relevant: Vec<i64> = relevant.into_iter().collect();
+        relevant.sort_unstable();
         for osm_id in &relevant {
             if let Some(&(lat, lon)) = raw_nodes.get(osm_id) {
                 let node_id = NodeId::new(next_id);
@@ -214,3 +226,274 @@ fn speed_m_per_min(highway: &str) -> f64 {
 }
 
 // haversine_m moved to geo_utils — re-exported here for callers within this module.
+
+// ---------------------------------------------------------------------------
+// Boundary extraction
+// ---------------------------------------------------------------------------
+
+/// Extract Hamburg's administrative boundary from the OSM PBF.
+///
+/// Looks for the relation with `boundary=administrative`, `admin_level=4`,
+/// `name=Hamburg`. Assembles all outer-member ways into closed rings, then
+/// returns the **largest polygon by bounding-box area** — this naturally
+/// excludes the Neuwerk island group far out in the North Sea.
+pub fn extract_admin_boundary(path: &Path) -> Result<Polygon<f64>, Box<dyn std::error::Error>> {
+    // ----- Pass 1: find the Hamburg boundary relation → outer way IDs -----
+    let mut outer_way_ids: Vec<i64> = Vec::new();
+
+    {
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| {
+            if let Element::Relation(r) = element {
+                let mut is_boundary  = false;
+                let mut is_admin     = false;
+                let mut is_hamburg   = false;
+                let mut is_level_4   = false;
+
+                for (k, v) in r.tags() {
+                    match k {
+                        "type"        if v == "boundary"       => is_boundary  = true,
+                        "boundary"    if v == "administrative"  => is_admin     = true,
+                        "admin_level" if v == "4"               => is_level_4   = true,
+                        "name"        if v == "Hamburg"         => is_hamburg   = true,
+                        _ => {}
+                    }
+                }
+
+                if is_boundary && is_admin && is_level_4 && is_hamburg {
+                    for member in r.members() {
+                        if matches!(member.member_type, RelMemberType::Way)
+                            && member.role().map(|r| r == "outer").unwrap_or(false)
+                        {
+                            outer_way_ids.push(member.member_id);
+                        }
+                    }
+                }
+            }
+        })?;
+    }
+
+    if outer_way_ids.is_empty() {
+        return Err("Hamburg admin_level=4 boundary relation not found in OSM file".into());
+    }
+
+    let outer_set: HashSet<i64> = outer_way_ids.iter().copied().collect();
+
+    // ----- Pass 2: collect way node sequences for boundary ways -----
+    let mut way_nodes: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut needed_node_ids: HashSet<i64>     = HashSet::new();
+
+    {
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| {
+            if let Element::Way(w) = element {
+                if outer_set.contains(&w.id()) {
+                    let refs: Vec<i64> = w.refs().collect();
+                    for &n in &refs {
+                        needed_node_ids.insert(n);
+                    }
+                    way_nodes.insert(w.id(), refs);
+                }
+            }
+        })?;
+    }
+
+    // ----- Pass 3: collect node coordinates for boundary nodes -----
+    let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
+
+    {
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| match element {
+            Element::Node(n) => {
+                if needed_node_ids.contains(&n.id()) {
+                    node_coords.insert(n.id(), (n.lat(), n.lon()));
+                }
+            }
+            Element::DenseNode(n) => {
+                if needed_node_ids.contains(&n.id()) {
+                    node_coords.insert(n.id(), (n.lat(), n.lon()));
+                }
+            }
+            _ => {}
+        })?;
+    }
+
+    // ----- Assemble ways into closed rings -----
+    let segs: Vec<Vec<i64>> = outer_way_ids
+        .iter()
+        .filter_map(|id| way_nodes.get(id).cloned())
+        .collect();
+
+    let rings = chain_ways_into_rings(segs);
+
+    if rings.is_empty() {
+        return Err("could not assemble any boundary ring from OSM ways".into());
+    }
+
+    // Convert each ring to a geo::Polygon and pick the largest.
+    let polygons: Vec<Polygon<f64>> = rings
+        .into_iter()
+        .filter_map(|ring| {
+            let coords: Vec<Coord<f64>> = ring
+                .iter()
+                .filter_map(|id| {
+                    node_coords.get(id).map(|&(lat, lon)| Coord { x: lon, y: lat })
+                })
+                .collect();
+            if coords.len() < 3 {
+                return None;
+            }
+            Some(Polygon::new(LineString::from(coords), vec![]))
+        })
+        .collect();
+
+    polygons
+        .into_iter()
+        .max_by(|a, b| {
+            let size = |p: &Polygon<f64>| {
+                p.bounding_rect()
+                    .map(|r| (r.max().x - r.min().x) * (r.max().y - r.min().y))
+                    .unwrap_or(0.0)
+            };
+            size(a).partial_cmp(&size(b)).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| "no valid boundary polygons found".into())
+}
+
+/// Chain OSM way node sequences into closed rings.
+///
+/// Each way is a `Vec<i64>` of node IDs. Ways are joined by matching the last
+/// node of one way with the first node of the next (flipping if needed).
+/// Multiple disjoint rings (e.g. mainland + island) are returned separately.
+fn chain_ways_into_rings(mut segs: Vec<Vec<i64>>) -> Vec<Vec<i64>> {
+    if segs.is_empty() { return vec![]; }
+
+    // endpoint_node → list of (seg_idx, at_start: bool)
+    let mut endpoint_map: HashMap<i64, Vec<(usize, bool)>> = HashMap::new();
+    for (i, seg) in segs.iter().enumerate() {
+        if let Some(&first) = seg.first() {
+            endpoint_map.entry(first).or_default().push((i, true));
+        }
+        if let Some(&last) = seg.last() {
+            endpoint_map.entry(last).or_default().push((i, false));
+        }
+    }
+
+    let n = segs.len();
+    let mut used = vec![false; n];
+    let mut rings: Vec<Vec<i64>> = Vec::new();
+    let mut start = 0;
+
+    while start < n {
+        while start < n && used[start] { start += 1; }
+        if start >= n { break; }
+
+        used[start] = true;
+        let mut ring: Vec<i64> = std::mem::take(&mut segs[start]);
+        let ring_start = *ring.first().unwrap();
+
+        loop {
+            let current_end = *ring.last().unwrap();
+            if current_end == ring_start && ring.len() > 1 { break; }
+
+            let candidates = endpoint_map.get(&current_end).cloned().unwrap_or_default();
+            let mut found = false;
+            for (idx, at_start) in candidates {
+                if used[idx] { continue; }
+                used[idx] = true;
+                found = true;
+                let mut seg = std::mem::take(&mut segs[idx]);
+                if !at_start { seg.reverse(); }
+                ring.extend_from_slice(&seg[1..]);
+                break;
+            }
+            if !found { break; }
+        }
+
+        rings.push(ring);
+    }
+
+    rings
+}
+
+// ---------------------------------------------------------------------------
+// Police station extraction
+// ---------------------------------------------------------------------------
+
+/// Extract police station POIs (`amenity=police`) from the OSM PBF.
+///
+/// Handles both node-tagged stations and way-tagged building footprints
+/// (using the position of the first node in the way as the location).
+pub fn extract_police_stations(path: &Path) -> Result<Vec<PoliceStation>, Box<dyn std::error::Error>> {
+    let mut stations: Vec<PoliceStation>    = Vec::new();
+    let mut pending_ways: Vec<(String, i64)> = Vec::new(); // (name, first_node_ref)
+    let mut needed_node_ids: HashSet<i64>   = HashSet::new();
+
+    // ----- Pass 1: collect nodes and way refs with amenity=police -----
+    {
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| match element {
+            Element::Node(n) => {
+                let mut is_police = false;
+                let mut name = String::new();
+                for (k, v) in n.tags() {
+                    match k {
+                        "amenity" if v == "police" => is_police = true,
+                        "name"                     => name = v.to_string(),
+                        _                          => {}
+                    }
+                }
+                if is_police {
+                    stations.push(PoliceStation { name, lat: n.lat(), lon: n.lon() });
+                }
+            }
+            Element::Way(w) => {
+                let mut is_police = false;
+                let mut name = String::new();
+                for (k, v) in w.tags() {
+                    match k {
+                        "amenity" if v == "police" => is_police = true,
+                        "name"                     => name = v.to_string(),
+                        _                          => {}
+                    }
+                }
+                if is_police {
+                    if let Some(&first_ref) = w.refs().next().as_ref() {
+                        needed_node_ids.insert(first_ref);
+                        pending_ways.push((name, first_ref));
+                    }
+                }
+            }
+            _ => {}
+        })?;
+    }
+
+    // ----- Pass 2 (only if there are way-tagged stations): resolve node positions -----
+    if !pending_ways.is_empty() {
+        let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
+
+        let reader = ElementReader::from_path(path)?;
+        reader.for_each(|element| match element {
+            Element::Node(n) => {
+                if needed_node_ids.contains(&n.id()) {
+                    node_coords.insert(n.id(), (n.lat(), n.lon()));
+                }
+            }
+            Element::DenseNode(n) => {
+                if needed_node_ids.contains(&n.id()) {
+                    node_coords.insert(n.id(), (n.lat(), n.lon()));
+                }
+            }
+            _ => {}
+        })?;
+
+        for (name, node_id) in pending_ways {
+            if let Some(&(lat, lon)) = node_coords.get(&node_id) {
+                stations.push(PoliceStation { name, lat, lon });
+            }
+        }
+    }
+
+    stations.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(stations)
+}
