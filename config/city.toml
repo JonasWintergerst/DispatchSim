@@ -33,6 +33,7 @@ tick_minutes     = 1
 duration_minutes = 2_102_400   # 4 simulated years
 rng_seed         = 42
 sim_type         = "Police"
+record_routes    = false
 osm_path         = "config/hamburg-260331.osm.pbf"
 
 # Maps the abstract (col, row) hex grid onto Hamburg's geographic footprint.

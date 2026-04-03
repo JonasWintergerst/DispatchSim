@@ -7,7 +7,6 @@ pub struct Unit {
     pub status: UnitStatus,
     position: NodeId,
     home: NodeId,
-    pub route: Vec<NodeId>,
     pub assigned_incident: Option<IncidentId>,
     pub dispatch_time: Option<SimTime>,
     pub arrival_time: Option<SimTime>,
@@ -24,7 +23,6 @@ impl Unit {
             status: UnitStatus::Idle,
             position: station,
             home: station,
-            route: Vec::new(),
             assigned_incident: None,
             dispatch_time: None,
             arrival_time: None,
@@ -36,14 +34,12 @@ impl Unit {
     /// embedded in the paired UnitArrival event for stale-event detection.
     pub fn dispatch(
         &mut self,
-        route: Vec<NodeId>,
         time: SimTime,
         arrival_time: SimTime,
         incident_id: IncidentId,
     ) -> u32 {
         self.dispatch_id += 1;
         self.status = UnitStatus::Dispatched;
-        self.route = route;
         self.dispatch_time = Some(time);
         self.arrival_time = Some(arrival_time);
         self.assigned_incident = Some(incident_id);

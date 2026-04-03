@@ -17,6 +17,16 @@ fn main() {
         return;
     }
 
+    if args.get(1).map(String::as_str) == Some("heatmap") {
+        let db_path  = args.get(2).map(String::as_str).unwrap_or("./output/dispatch_sim.db");
+        let out_path = args.get(3).map(String::as_str).unwrap_or("./output/heatmap.geojson");
+        dispatch_sim::report::export_heatmap(db_path, out_path).unwrap_or_else(|e| {
+            eprintln!("error generating heatmap: {}", e);
+            process::exit(1);
+        });
+        return;
+    }
+
     let config_path = resolve_config_path();
 
     println!("Loading config from: {}", config_path.display());

@@ -12,7 +12,7 @@ use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIter
 use crate::clock::{SimClock, SimTime};
 use crate::config::{LoadedConfig, SpawnProfileConfig};
 use crate::district::District;
-use crate::event_log::{Event, EventLog};
+use crate::event_log::{Event, EventLog, RouteRecord};
 use crate::event_queue::SimEvent;
 use crate::geo_utils::haversine_m;
 use crate::hex::Hex;
@@ -35,6 +35,7 @@ pub struct City {
     pub event_heap: BinaryHeap<Reverse<SimEvent>>,
     event_log:      EventLog,
     event_buffer:   Vec<Event>,
+    route_buffer:   Vec<RouteRecord>,
     next_flush:     u64,
     profiles:       HashMap<SpawnProfileId, SpawnProfile>,
     sim_type:       SimType,
@@ -64,7 +65,7 @@ impl City {
         // Use par_iter_mut only when multiple districts have concurrent events —
         // for the common case (1 event, 1 district) the Rayon thread overhead
         // dominates over the tiny amount of work.
-        let follow_on: Vec<(SimEvent, Event)> = if district_batches.len() > 2 {
+        let follow_on: Vec<(SimEvent, Event, Option<RouteRecord>)> = if district_batches.len() > 2 {
             self.districts
                 .par_iter_mut()
                 .flat_map(|d| {
@@ -83,11 +84,14 @@ impl City {
                 .collect()
         };
 
-        for (sim_ev, log_ev) in follow_on {
+        for (sim_ev, log_ev, route) in follow_on {
             if !matches!(sim_ev, SimEvent::NoOp) {
                 self.event_heap.push(Reverse(sim_ev));
             }
             self.event_buffer.push(log_ev);
+            if let Some(r) = route {
+                self.route_buffer.push(r);
+            }
         }
 
         self.clock.elapsed_min = next_time.0;
@@ -99,11 +103,18 @@ impl City {
     }
 
     pub fn flush(&mut self) {
-        if self.event_buffer.is_empty() { return; }
-        self.event_log
-            .insert_batch(&self.event_buffer)
-            .expect("event log write failed");
-        self.event_buffer.clear();
+        if !self.event_buffer.is_empty() {
+            self.event_log
+                .insert_batch(&self.event_buffer)
+                .expect("event log write failed");
+            self.event_buffer.clear();
+        }
+        if !self.route_buffer.is_empty() {
+            self.event_log
+                .insert_routes_batch(&self.route_buffer)
+                .expect("route log write failed");
+            self.route_buffer.clear();
+        }
     }
 
     pub fn from_config(cfg: &LoadedConfig) -> Self {
@@ -239,7 +250,7 @@ impl City {
                 );
 
                 let district_rng = SmallRng::seed_from_u64(setup.rng_seed);
-                District::new(district_id, station, units, hexes, district_rng, routing)
+                District::new(district_id, station, units, hexes, district_rng, routing, cfg.city.sim.record_routes)
             })
             .collect();
 
@@ -255,6 +266,7 @@ impl City {
             event_log:     EventLog::open("./output/dispatch_sim.db")
                                .expect("could not open event log"),
             event_buffer:  Vec::new(),
+            route_buffer:  Vec::new(),
             next_flush:    FLUSH_EVERY_MINS,
             profiles,
             sim_type,

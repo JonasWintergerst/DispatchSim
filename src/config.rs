@@ -76,6 +76,10 @@ pub struct SimConfig {
     /// Path to an OSM PBF file for real road routing. If absent, falls back
     /// to synthetic H3-adjacency routing.
     pub osm_path: Option<String>,
+    /// When true, compute and store full A* route paths per dispatch for
+    /// heatmap analysis. Disabled by default because A* is expensive.
+    #[serde(default)]
+    pub record_routes: bool,
 }
 
 #[derive(Debug, Deserialize)]

@@ -177,6 +177,14 @@ impl RoutingEngine {
             .collect()
     }
 
+    /// Position (lon, lat) of a node in the graph.
+    pub fn node_position(&self, id: NodeId) -> Option<(f64, f64)> {
+        self.node_index.get(&id).map(|&nx| {
+            let p = self.graph[nx].position;
+            (p.x(), p.y()) // geo::Point stores (lon, lat)
+        })
+    }
+
     fn compute_route(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {
         let (Some(&from_nx), Some(&to_nx)) =
             (self.node_index.get(&from), self.node_index.get(&to))

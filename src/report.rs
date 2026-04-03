@@ -2,6 +2,7 @@
 // Queries dispatch_sim.db and prints a post-run analysis report to stdout.
 // Invoked via:  dispatch_sim report [path/to/dispatch_sim.db]
 
+use std::collections::HashMap;
 use rusqlite::{Connection, Result};
 
 pub fn print_report(db_path: &str) -> Result<()> {
@@ -362,6 +363,92 @@ fn print_hourly_incidents(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Route heatmap export
+// ---------------------------------------------------------------------------
+
+/// Read all dispatch routes from `db_path`, aggregate edge traversal counts,
+/// and write a GeoJSON FeatureCollection to `output_path`.
+///
+/// Each feature is a LineString (one road segment) with a `count` property
+/// indicating how many times that segment was traversed across all dispatches.
+/// Suitable for loading in QGIS or any GeoJSON-capable tile renderer.
+pub fn export_heatmap(db_path: &str, output_path: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+
+    // Ensure the table exists (may be missing on old DBs).
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dispatch_routes (incident_id TEXT PRIMARY KEY, path TEXT NOT NULL);"
+    )?;
+
+    let route_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM dispatch_routes", [], |r| r.get(0))?;
+
+    if route_count == 0 {
+        eprintln!("heatmap: no routes in database — run the simulation first");
+        return Ok(());
+    }
+
+    // Microdegree coordinate pair — used as a hashable, order-independent edge key.
+    type Coord    = (i64, i64);
+    type EdgeKey  = (Coord, Coord);
+
+    let mut edge_counts: HashMap<EdgeKey, u64> = HashMap::new();
+
+    let mut stmt = conn.prepare("SELECT path FROM dispatch_routes")?;
+    let paths: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for path_json in &paths {
+        let coords: Vec<[f64; 2]> = match serde_json::from_str(path_json) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for window in coords.windows(2) {
+            let a = to_microdeg(window[0][0], window[0][1]);
+            let b = to_microdeg(window[1][0], window[1][1]);
+            let key: EdgeKey = if a <= b { (a, b) } else { (b, a) };
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    println!(
+        "heatmap: {} routes → {} unique edges",
+        fmt_int(route_count),
+        fmt_int(edge_counts.len() as i64),
+    );
+
+    // Build GeoJSON manually — avoids adding a dependency.
+    let mut features: Vec<String> = Vec::with_capacity(edge_counts.len());
+    for ((a, b), count) in &edge_counts {
+        let lon_a = a.0 as f64 / 1_000_000.0;
+        let lat_a = a.1 as f64 / 1_000_000.0;
+        let lon_b = b.0 as f64 / 1_000_000.0;
+        let lat_b = b.1 as f64 / 1_000_000.0;
+        features.push(format!(
+            r#"{{"type":"Feature","geometry":{{"type":"LineString","coordinates":[[{lon_a},{lat_a}],[{lon_b},{lat_b}]]}},"properties":{{"count":{count}}}}}"#,
+        ));
+    }
+
+    let geojson = format!(
+        r#"{{"type":"FeatureCollection","features":[{}]}}"#,
+        features.join(",")
+    );
+
+    std::fs::write(output_path, geojson)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+    println!("heatmap: written to {}", output_path);
+    Ok(())
+}
+
+/// Convert a (lon, lat) float pair to integer microdegrees for use as a map key.
+fn to_microdeg(lon: f64, lat: f64) -> (i64, i64) {
+    ((lon * 1_000_000.0).round() as i64, (lat * 1_000_000.0).round() as i64)
 }
 
 // ---------------------------------------------------------------------------
