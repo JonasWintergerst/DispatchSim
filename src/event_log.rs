@@ -37,6 +37,10 @@ pub struct Event {
     pub district: DistrictId,
     pub unit: Option<UnitId>,
     pub incident: Option<IncidentId>,
+    /// "A", "B", or "C" — populated only for IncidentSpawned events.
+    pub priority: Option<String>,
+    /// "Fire", "MedicalEmergency", "Crime", "Accident" — populated only for IncidentSpawned.
+    pub incident_kind: Option<String>,
 }
 
 pub struct EventLog {
@@ -53,18 +57,21 @@ impl EventLog {
             PRAGMA journal_mode = WAL;
 
             CREATE TABLE IF NOT EXISTS events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                sim_time    INTEGER NOT NULL,
-                kind        TEXT    NOT NULL,
-                district    INTEGER NOT NULL,
-                unit        INTEGER,
-                incident    TEXT
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                sim_time      INTEGER NOT NULL,
+                kind          TEXT    NOT NULL,
+                district      INTEGER NOT NULL,
+                unit          INTEGER,
+                incident      TEXT,
+                priority      TEXT,
+                incident_kind TEXT
             );
 
-            CREATE INDEX IF NOT EXISTS idx_sim_time ON events (sim_time);
-            CREATE INDEX IF NOT EXISTS idx_district ON events (district);
-            CREATE INDEX IF NOT EXISTS idx_kind     ON events (kind);
-            CREATE INDEX IF NOT EXISTS idx_incident ON events (incident);
+            CREATE INDEX IF NOT EXISTS idx_sim_time  ON events (sim_time);
+            CREATE INDEX IF NOT EXISTS idx_district  ON events (district);
+            CREATE INDEX IF NOT EXISTS idx_kind      ON events (kind);
+            CREATE INDEX IF NOT EXISTS idx_incident  ON events (incident);
+            CREATE INDEX IF NOT EXISTS idx_priority  ON events (priority);
         ")?;
 
         Ok(Self { conn })
@@ -78,8 +85,8 @@ impl EventLog {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO events (sim_time, kind, district, unit, incident)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO events (sim_time, kind, district, unit, incident, priority, incident_kind)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
 
             for e in events {
@@ -89,6 +96,8 @@ impl EventLog {
                     e.district.value(),
                     e.unit.map(|u| u.value()),
                     e.incident.as_ref().map(|i| i.value()),
+                    e.priority.as_deref(),
+                    e.incident_kind.as_deref(),
                 ])?;
             }
         }

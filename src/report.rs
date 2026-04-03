@@ -16,6 +16,7 @@ pub fn print_report(db_path: &str) -> Result<()> {
     println!("Database: {}\n", db_path);
 
     print_overview(&conn)?;
+    print_sla_compliance(&conn)?;
     print_response_times(&conn)?;
     print_on_scene_duration(&conn)?;
     print_utilization(&conn)?;
@@ -58,6 +59,100 @@ fn print_overview(conn: &Connection) -> Result<()> {
     println!("  Spawned:       {:>12}", fmt_int(spawned));
     println!("  Resolved:      {:>12}", fmt_int(resolved));
     println!("  Open / queued: {:>12}  ({:.1}% unresolved)", fmt_int(open), open_pct);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SLA compliance  (response time vs. target by priority)
+// ---------------------------------------------------------------------------
+
+fn print_sla_compliance(conn: &Connection) -> Result<()> {
+    // Silently add columns if this DB was created before priority logging was added.
+    let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN priority TEXT;");
+    let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN incident_kind TEXT;");
+
+    let has_data: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind='IncidentSpawned' AND priority IS NOT NULL",
+        [], |r| r.get(0),
+    )?;
+
+    if has_data == 0 {
+        println!("\nSLA Compliance — no priority data (re-run simulation)");
+        return Ok(());
+    }
+
+    // SLA targets: Priority A ≤ 5 min, B ≤ 15 min, C ≤ 60 min
+    // (German Einsatz 1/2/3 / APCO CAD standard)
+    const TARGETS: &[(&str, i64)] = &[("A", 5), ("B", 15), ("C", 60)];
+
+    let mut stmt = conn.prepare(
+        "SELECT s.priority, a.district, (a.sim_time - s.sim_time) AS rt
+         FROM events s
+         JOIN events a ON s.incident = a.incident
+         WHERE s.kind = 'IncidentSpawned'
+           AND a.kind = 'UnitArrived'
+           AND s.priority IS NOT NULL
+         ORDER BY s.priority, a.district",
+    )?;
+
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        println!("\nSLA Compliance — no dispatched-incident data");
+        return Ok(());
+    }
+
+    // ── City-wide summary per priority ───────────────────────────────────
+    println!("\nSLA Compliance  (first-unit response time vs. target)");
+    println!("  {:<12} {:>8} {:>10} {:>10} {:>8} {:>8}",
+             "Priority", "Target", "N", "Met SLA", "%", "Avg RT");
+
+    for (prio, target) in TARGETS {
+        let times: Vec<i64> = rows.iter()
+            .filter(|(p, _, _)| p == prio)
+            .map(|(_, _, rt)| *rt)
+            .collect();
+        if times.is_empty() { continue; }
+        let n         = times.len() as i64;
+        let met       = times.iter().filter(|&&rt| rt <= *target).count() as i64;
+        let pct       = met as f64 / n as f64 * 100.0;
+        let avg       = times.iter().sum::<i64>() as f64 / n as f64;
+        println!("  {:<12} {:>7}m {:>10} {:>10} {:>7.1}% {:>8.1}",
+                 format!("Priority {prio}"), target,
+                 fmt_int(n), fmt_int(met), pct, avg);
+    }
+
+    // ── Per-district breakdown ───────────────────────────────────────────
+    let mut by_district: std::collections::BTreeMap<i64, std::collections::HashMap<String, Vec<i64>>> =
+        std::collections::BTreeMap::new();
+    for (prio, district, rt) in &rows {
+        by_district
+            .entry(*district)
+            .or_default()
+            .entry(prio.clone())
+            .or_default()
+            .push(*rt);
+    }
+
+    println!("\n  Per-District Breakdown");
+    println!("  {:<10} {:<6} {:>8} {:>8} {:>8} {:>8}",
+             "District", "Prio", "N", "Met SLA", "%", "Avg RT");
+
+    for (district, by_prio) in &by_district {
+        for (prio, target) in TARGETS {
+            let Some(times) = by_prio.get(*prio) else { continue };
+            let n   = times.len() as i64;
+            let met = times.iter().filter(|&&rt| rt <= *target).count() as i64;
+            let pct = met as f64 / n as f64 * 100.0;
+            let avg = times.iter().sum::<i64>() as f64 / n as f64;
+            println!("  {:<10} {:<6} {:>8} {:>8} {:>7.1}% {:>8.1}",
+                     district, prio, fmt_int(n), fmt_int(met), pct, avg);
+        }
+    }
 
     Ok(())
 }

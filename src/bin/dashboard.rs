@@ -71,6 +71,19 @@ fn spawn_with_live_stdout(mut cmd: Command) -> Result<RunningProcess, std::io::E
     Ok(RunningProcess { child, stdout_rx: rx })
 }
 
+// ── Reports page types ────────────────────────────────────────────────────────
+
+struct SavedReport {
+    name: String,
+    content: String,
+}
+
+#[derive(PartialEq)]
+enum ActiveTab {
+    Map,
+    Reports,
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 struct DashboardApp {
@@ -83,7 +96,17 @@ struct DashboardApp {
     /// Latest relevant progress line from the running process
     live_output: String,
     process: Option<RunningProcess>,
+    /// Raw text of the most recently generated report
     report_text: Option<String>,
+
+    // ── Reports page ──────────────────────────────────────────────────────
+    active_tab: ActiveTab,
+    saved_reports: Vec<SavedReport>,
+    report_name_input: String,
+    /// Index of the report shown on the left half (or full view when no right)
+    viewing: Option<usize>,
+    /// Index of the report shown on the right half (side-by-side comparison)
+    comparing: Option<usize>,
 }
 
 impl DashboardApp {
@@ -100,6 +123,11 @@ impl DashboardApp {
             live_output: String::new(),
             process: None,
             report_text: None,
+            active_tab: ActiveTab::Map,
+            saved_reports: Vec::new(),
+            report_name_input: "Run 1".into(),
+            viewing: None,
+            comparing: None,
         }
     }
 
@@ -189,10 +217,21 @@ impl DashboardApp {
                 self.report_text = Some(if !text.trim().is_empty() { text }
                                         else if !err.trim().is_empty() { err }
                                         else { "(no output)".into() });
+                // Suggest a default name for saving
+                self.report_name_input = format!("Run {}", self.saved_reports.len() + 1);
                 self.status = "Report ready.".into();
             }
             Err(e) => self.status = format!("Failed to run report: {e}"),
         }
+    }
+
+    fn save_current_report(&mut self) {
+        let Some(content) = self.report_text.clone() else { return };
+        let name = self.report_name_input.trim().to_owned();
+        if name.is_empty() { return; }
+        self.saved_reports.push(SavedReport { name, content });
+        // Pre-fill next name
+        self.report_name_input = format!("Run {}", self.saved_reports.len() + 1);
     }
 }
 
@@ -218,12 +257,16 @@ impl eframe::App for DashboardApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
-        // Top panel — buttons + status
+        // ── Toolbar (always visible) ──────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let busy = self.process.is_some();
+                // Tab switcher
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Map,     "🗺 Map");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::Reports, "📊 Reports");
+                ui.separator();
 
+                let busy = self.process.is_some();
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui.button("⚙ Optimize").clicked() { self.spawn_optimize(); }
                     if ui.button("▶ Simulate").clicked() { self.spawn_simulate(); }
@@ -245,14 +288,24 @@ impl eframe::App for DashboardApp {
             ui.add_space(4.0);
         });
 
-        // Optional bottom panel — report text
+        // ── Tab-specific content ──────────────────────────────────────────
+        match self.active_tab {
+            ActiveTab::Map => self.show_map_tab(ctx),
+            ActiveTab::Reports => self.show_reports_tab(ctx),
+        }
+    }
+}
+
+impl DashboardApp {
+    fn show_map_tab(&mut self, ctx: &egui::Context) {
+        // Optional bottom panel — quick view of the latest report
         if let Some(text) = &self.report_text.clone() {
             egui::TopBottomPanel::bottom("report_panel")
                 .resizable(true)
                 .min_height(120.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.heading("Report");
+                        ui.heading("Latest Report");
                         if ui.small_button("✖ Close").clicked() {
                             self.report_text = None;
                         }
@@ -267,12 +320,164 @@ impl eframe::App for DashboardApp {
                 });
         }
 
-        // Central panel — hex map
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
             draw_hex_map(ui, rect, &self.hexes, &self.stations, self.lat_range, self.lon_range);
         });
     }
+
+    fn show_reports_tab(&mut self, ctx: &egui::Context) {
+        // ── Save bar ─────────────────────────────────────────────────────
+        egui::TopBottomPanel::top("save_bar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Save current report:");
+                let name_edit = egui::TextEdit::singleline(&mut self.report_name_input)
+                    .desired_width(180.0);
+                ui.add(name_edit);
+                let can_save = self.report_text.is_some()
+                    && !self.report_name_input.trim().is_empty();
+                if ui.add_enabled(can_save, egui::Button::new("💾 Save")).clicked() {
+                    self.save_current_report();
+                }
+                if self.report_text.is_none() {
+                    ui.label(
+                        egui::RichText::new("(no report loaded — click 📋 Report first)")
+                            .weak(),
+                    );
+                }
+            });
+            ui.add_space(4.0);
+        });
+
+        // ── Report list sidebar ───────────────────────────────────────────
+        let mut delete_idx: Option<usize> = None;
+        let mut new_viewing  = self.viewing;
+        let mut new_comparing = self.comparing;
+
+        egui::SidePanel::left("report_list_panel")
+            .min_width(200.0)
+            .max_width(300.0)
+            .show(ctx, |ui| {
+                ui.heading(format!("Saved Reports ({})", self.saved_reports.len()));
+                ui.separator();
+
+                if self.saved_reports.is_empty() {
+                    ui.weak("No saved reports yet.");
+                    return;
+                }
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (idx, report) in self.saved_reports.iter().enumerate() {
+                        let is_viewing   = self.viewing   == Some(idx);
+                        let is_comparing = self.comparing == Some(idx);
+
+                        // Highlight selected rows
+                        let bg = if is_viewing && is_comparing {
+                            Color32::from_rgba_premultiplied(100, 80, 180, 80)
+                        } else if is_viewing {
+                            Color32::from_rgba_premultiplied(60, 120, 60, 80)
+                        } else if is_comparing {
+                            Color32::from_rgba_premultiplied(140, 80, 40, 80)
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+
+                        egui::Frame::default()
+                            .fill(bg)
+                            .inner_margin(egui::Margin::symmetric(4, 2))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Report name as a clickable label (sets viewing)
+                                    if ui.selectable_label(is_viewing, &report.name).clicked() {
+                                        new_viewing = if is_viewing { None } else { Some(idx) };
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    // "B" button toggles comparison slot
+                                    let compare_label = if is_comparing { "◀ B" } else { "B ▶" };
+                                    if ui.small_button(compare_label).on_hover_text(
+                                        if is_comparing { "Remove from comparison" }
+                                        else { "Show side-by-side with A" }
+                                    ).clicked() {
+                                        new_comparing = if is_comparing { None } else { Some(idx) };
+                                    }
+                                    if ui.small_button("✖").on_hover_text("Delete").clicked() {
+                                        delete_idx = Some(idx);
+                                    }
+                                });
+                            });
+                        ui.separator();
+                    }
+                });
+            });
+
+        // Apply list mutations after the borrow on self ends
+        self.viewing   = new_viewing;
+        self.comparing = new_comparing;
+
+        if let Some(idx) = delete_idx {
+            self.saved_reports.remove(idx);
+            // Fixup indices
+            if self.viewing   == Some(idx) { self.viewing   = None; }
+            else if let Some(v) = self.viewing   { if v > idx { self.viewing   = Some(v - 1); } }
+            if self.comparing == Some(idx) { self.comparing = None; }
+            else if let Some(c) = self.comparing { if c > idx { self.comparing = Some(c - 1); } }
+        }
+
+        // ── Central report view ───────────────────────────────────────────
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match (self.viewing, self.comparing) {
+                (None, None) => {
+                    ui.centered_and_justified(|ui| {
+                        ui.weak("Select a report from the list to view it.\nClick 'B ▶' on a second report to compare side by side.");
+                    });
+                }
+                (Some(a), None) | (None, Some(a)) => {
+                    // Single report view
+                    if let Some(report) = self.saved_reports.get(a) {
+                        show_report_panel(ui, &report.name, &report.content);
+                    }
+                }
+                (Some(a), Some(b)) => {
+                    // Side-by-side comparison
+                    let left_name    = self.saved_reports.get(a).map(|r| r.name.clone()).unwrap_or_default();
+                    let left_content = self.saved_reports.get(a).map(|r| r.content.clone()).unwrap_or_default();
+                    let right_name    = self.saved_reports.get(b).map(|r| r.name.clone()).unwrap_or_default();
+                    let right_content = self.saved_reports.get(b).map(|r| r.content.clone()).unwrap_or_default();
+
+                    // Split into two equal columns
+                    let total_w = ui.available_width();
+                    let col_w   = (total_w - 8.0) / 2.0; // 8px gap
+
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(Vec2::new(col_w, ui.available_height()), |ui| {
+                            show_report_panel(ui, &left_name, &left_content);
+                        });
+                        ui.add_space(8.0);
+                        ui.allocate_ui(Vec2::new(col_w, ui.available_height()), |ui| {
+                            show_report_panel(ui, &right_name, &right_content);
+                        });
+                    });
+                }
+            }
+        });
+    }
+}
+
+/// Render a single named report in a scrollable monospace text area.
+fn show_report_panel(ui: &mut egui::Ui, name: &str, content: &str) {
+    ui.heading(name);
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .id_salt(name)
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut content.as_ref() as &mut &str)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_width(f32::INFINITY),
+            );
+        });
 }
 
 // ── Hex map rendering ─────────────────────────────────────────────────────────
@@ -403,7 +608,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Dispatch Sim — Dashboard")
-            .with_inner_size([900.0, 700.0]),
+            .with_inner_size([1100.0, 750.0]),
         ..Default::default()
     };
     eframe::run_native(
