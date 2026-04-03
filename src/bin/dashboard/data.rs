@@ -15,6 +15,14 @@ pub struct StationEntry {
     pub lon: f64,
 }
 
+#[derive(Deserialize)]
+pub struct DistrictEntry {
+    pub district_id: u32,
+    pub station_lat: f64,
+    pub station_lon: f64,
+    pub station_name: String,
+}
+
 pub fn load_hexes() -> Vec<HexEntry> {
     let path = "config/hexes.json";
     let mut file = match std::fs::File::open(path) {
@@ -35,6 +43,36 @@ pub fn load_stations() -> Vec<StationEntry> {
     let mut buf = String::new();
     file.read_to_string(&mut buf).ok();
     serde_json::from_str(&buf).unwrap_or_default()
+}
+
+pub fn load_district_stations() -> Vec<DistrictEntry> {
+    let path = "config/districts.json";
+    let mut file = match std::fs::File::open(path) {
+        Ok(f)  => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok();
+    serde_json::from_str(&buf).unwrap_or_default()
+}
+
+/// Returns minimum travel time in minutes (haversine at 30 km/h) from (lat, lon)
+/// to the nearest district station. Returns `f32::MAX` if there are no stations.
+pub fn min_travel_min(lat: f64, lon: f64, stations: &[DistrictEntry]) -> f32 {
+    const SPEED_M_PER_MIN: f64 = 500.0; // 30 km/h = 500 m/min
+    stations
+        .iter()
+        .map(|s| (haversine_m(lat, lon, s.station_lat, s.station_lon) / SPEED_M_PER_MIN) as f32)
+        .fold(f32::MAX, f32::min)
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const R: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
 pub fn bounds(hexes: &[HexEntry]) -> ((f64, f64), (f64, f64)) {

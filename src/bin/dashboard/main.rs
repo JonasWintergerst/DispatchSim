@@ -31,6 +31,11 @@ struct DashboardApp {
     process: Option<RunningProcess>,
     report_text: Option<String>,
 
+    // ── Isochrone overlay ─────────────────────────────────────────────────
+    /// Minimum haversine travel time in minutes to nearest station, one per hex.
+    isochrone_minutes: Vec<f32>,
+    show_isochrones: bool,
+
     // ── Reports page ─────────────────────────────────────────────────────
     active_tab: ActiveTab,
     saved_reports: Vec<SavedReport>,
@@ -44,6 +49,11 @@ impl DashboardApp {
         let hexes = data::load_hexes();
         let (lat_range, lon_range) = data::bounds(&hexes);
         let stations = data::load_stations();
+        let district_stations = data::load_district_stations();
+        let isochrone_minutes: Vec<f32> = hexes
+            .iter()
+            .map(|h| data::min_travel_min(h.lat, h.lon, &district_stations))
+            .collect();
         Self {
             hexes,
             stations,
@@ -53,6 +63,8 @@ impl DashboardApp {
             live_output: String::new(),
             process: None,
             report_text: None,
+            isochrone_minutes,
+            show_isochrones: false,
             active_tab: ActiveTab::Map,
             saved_reports: Vec::new(),
             report_name_input: "Run 1".into(),
@@ -176,6 +188,8 @@ impl eframe::App for DashboardApp {
                 });
                 if ui.button("📋 Report").clicked() { self.run_report(); }
 
+                ui.separator();
+                ui.toggle_value(&mut self.show_isochrones, "🌐 Isochrones");
                 ui.separator();
                 ui.label(&self.status);
 

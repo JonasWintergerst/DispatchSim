@@ -30,8 +30,21 @@ impl DashboardApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let rect = ui.available_rect_before_wrap();
-            draw_hex_map(ui, rect, &self.hexes, &self.stations, self.lat_range, self.lon_range);
+            let iso = if self.show_isochrones { Some(self.isochrone_minutes.as_slice()) } else { None };
+            draw_hex_map(ui, rect, &self.hexes, &self.stations, self.lat_range, self.lon_range, iso);
         });
+    }
+}
+
+fn isochrone_color(minutes: f32) -> Color32 {
+    if minutes <= 5.0 {
+        Color32::from_rgb(0, 200, 80)
+    } else if minutes <= 10.0 {
+        Color32::from_rgb(180, 220, 0)
+    } else if minutes <= 15.0 {
+        Color32::from_rgb(255, 140, 0)
+    } else {
+        Color32::from_rgb(220, 40, 40)
     }
 }
 
@@ -42,6 +55,7 @@ pub fn draw_hex_map(
     stations: &[StationEntry],
     (lat_min, lat_max): (f64, f64),
     (lon_min, lon_max): (f64, f64),
+    isochrone_minutes: Option<&[f32]>,
 ) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Color32::from_rgb(15, 15, 25));
@@ -54,10 +68,14 @@ pub fn draw_hex_map(
 
     let dot_r = ((inner.width() / lon_span as f32) * 0.0015).clamp(1.5, 6.0);
 
-    for hex in hexes {
+    for (i, hex) in hexes.iter().enumerate() {
         let x = inner.left() + ((hex.lon - lon_min) / lon_span) as f32 * inner.width();
         let y = inner.bottom() - ((hex.lat - lat_min) / lat_span) as f32 * inner.height();
-        painter.circle_filled(Pos2::new(x, y), dot_r, district_color(hex.district_id));
+        let color = match isochrone_minutes {
+            Some(iso) => isochrone_color(iso[i]),
+            None      => district_color(hex.district_id),
+        };
+        painter.circle_filled(Pos2::new(x, y), dot_r, color);
     }
 
     // Station markers
@@ -84,38 +102,70 @@ pub fn draw_hex_map(
     }
 
     // Legend
-    let mut district_ids: Vec<u32> = hexes.iter().map(|h| h.district_id).collect();
-    district_ids.sort_unstable();
-    district_ids.dedup();
-
-    let legend_x      = rect.right() - 110.0;
+    let legend_x       = rect.right() - 110.0;
     let legend_y_start = rect.top() + 10.0;
     let row_h          = 16.0;
 
-    painter.rect_filled(
-        Rect::from_min_size(
-            Pos2::new(legend_x - 4.0, legend_y_start - 4.0),
-            Vec2::new(104.0, district_ids.len() as f32 * row_h + 8.0),
-        ),
-        4.0,
-        Color32::from_rgba_premultiplied(0, 0, 0, 160),
-    );
+    if isochrone_minutes.is_some() {
+        let bands: &[(&str, Color32)] = &[
+            ("≤ 5 min",  Color32::from_rgb(0, 200, 80)),
+            ("≤ 10 min", Color32::from_rgb(180, 220, 0)),
+            ("≤ 15 min", Color32::from_rgb(255, 140, 0)),
+            ("> 15 min", Color32::from_rgb(220, 40, 40)),
+        ];
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(legend_x - 4.0, legend_y_start - 4.0),
+                Vec2::new(104.0, bands.len() as f32 * row_h + 8.0),
+            ),
+            4.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 160),
+        );
+        for (i, &(label, color)) in bands.iter().enumerate() {
+            let y = legend_y_start + i as f32 * row_h;
+            painter.circle_filled(Pos2::new(legend_x + 6.0, y + 6.0), 5.0, color);
+            painter.circle_stroke(
+                Pos2::new(legend_x + 6.0, y + 6.0),
+                5.0,
+                Stroke::new(0.5, Color32::WHITE),
+            );
+            painter.text(
+                Pos2::new(legend_x + 16.0, y),
+                egui::Align2::LEFT_TOP,
+                label,
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
+    } else {
+        let mut district_ids: Vec<u32> = hexes.iter().map(|h| h.district_id).collect();
+        district_ids.sort_unstable();
+        district_ids.dedup();
 
-    for (i, &id) in district_ids.iter().enumerate() {
-        let y     = legend_y_start + i as f32 * row_h;
-        let color = district_color(id);
-        painter.circle_filled(Pos2::new(legend_x + 6.0, y + 6.0), 5.0, color);
-        painter.circle_stroke(
-            Pos2::new(legend_x + 6.0, y + 6.0),
-            5.0,
-            Stroke::new(0.5, Color32::WHITE),
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(legend_x - 4.0, legend_y_start - 4.0),
+                Vec2::new(104.0, district_ids.len() as f32 * row_h + 8.0),
+            ),
+            4.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 160),
         );
-        painter.text(
-            Pos2::new(legend_x + 16.0, y),
-            egui::Align2::LEFT_TOP,
-            format!("District {id}"),
-            egui::FontId::proportional(11.0),
-            Color32::WHITE,
-        );
+        for (i, &id) in district_ids.iter().enumerate() {
+            let y     = legend_y_start + i as f32 * row_h;
+            let color = district_color(id);
+            painter.circle_filled(Pos2::new(legend_x + 6.0, y + 6.0), 5.0, color);
+            painter.circle_stroke(
+                Pos2::new(legend_x + 6.0, y + 6.0),
+                5.0,
+                Stroke::new(0.5, Color32::WHITE),
+            );
+            painter.text(
+                Pos2::new(legend_x + 16.0, y),
+                egui::Align2::LEFT_TOP,
+                format!("District {id}"),
+                egui::FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+        }
     }
 }

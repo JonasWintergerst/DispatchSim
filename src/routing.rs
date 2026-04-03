@@ -163,6 +163,20 @@ impl RoutingEngine {
         route
     }
 
+    /// Isochrone: all nodes reachable from `source` within `max_minutes`.
+    /// Returns a map of NodeId → travel_time_min using full-graph Dijkstra
+    /// (not limited to precomputed anchors).
+    pub fn isochrone_from(&self, source: NodeId, max_minutes: u32) -> HashMap<NodeId, u32> {
+        let Some(&source_nx) = self.node_index.get(&source) else {
+            return HashMap::new();
+        };
+        dijkstra(&self.graph, source_nx, None, |e| e.weight().travel_time_min)
+            .into_iter()
+            .filter(|&(_, cost)| cost <= max_minutes)
+            .map(|(nx, cost)| (self.graph[nx].id, cost))
+            .collect()
+    }
+
     fn compute_route(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {
         let (Some(&from_nx), Some(&to_nx)) =
             (self.node_index.get(&from), self.node_index.get(&to))
