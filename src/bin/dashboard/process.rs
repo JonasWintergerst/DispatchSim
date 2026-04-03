@@ -15,10 +15,8 @@ pub fn spawn_with_live_stdout(mut cmd: Command) -> Result<RunningProcess, std::i
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(l) = line {
-                let _ = tx.send(l);
-            }
+        for l in reader.lines().map_while(Result::ok) {
+            let _ = tx.send(l);
         }
     });
     Ok(RunningProcess { child, stdout_rx: rx })

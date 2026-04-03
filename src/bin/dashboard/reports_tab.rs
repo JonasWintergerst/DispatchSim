@@ -149,14 +149,14 @@ impl DashboardApp {
     }
 }
 
-fn show_report_panel(ui: &mut egui::Ui, name: &str, content: &str) {
+fn show_report_panel(ui: &mut egui::Ui, name: &str, mut content: &str) {
     ui.heading(name);
     ui.separator();
     egui::ScrollArea::vertical()
         .id_salt(name)
         .show(ui, |ui| {
             ui.add(
-                egui::TextEdit::multiline(&mut content.as_ref() as &mut &str)
+                egui::TextEdit::multiline(&mut content)
                     .font(egui::TextStyle::Monospace)
                     .desired_width(f32::INFINITY),
             );

@@ -17,6 +17,12 @@ Built in Rust. Uses real OpenStreetMap road data and H3 geospatial indexing.
 - Enforces contiguity (each district is a single connected region) and workload balance constraints
 - Writes `config/hexes.json` (hex → district assignment) and `config/districts.json` (district → selected station)
 
+**Dashboard** (`dashboard` binary) provides a live GUI for the full workflow:
+
+- Color-coded hex map showing district boundaries and station markers
+- One-click buttons to run the optimizer, simulator, and report generator
+- Save named reports and compare any two side-by-side
+
 **Simulator** (`dispatch_sim` binary) runs a parallel discrete-event simulation over the optimized layout:
 
 - Reads station locations from `config/districts.json` — units home to real, OSM-snapped station nodes
@@ -35,7 +41,14 @@ src/
 ├── main.rs                  # dispatch_sim binary entry point
 ├── lib.rs                   # shared library root
 ├── bin/
-│   └── optimize.rs          # optimize binary entry point
+│   ├── optimize.rs          # optimize binary entry point
+│   └── dashboard/           # dashboard GUI binary
+│       ├── main.rs           # app state, toolbar, tab dispatch, entry point
+│       ├── map_tab.rs        # hex map rendering, station markers, legend
+│       ├── reports_tab.rs    # report list, save/compare, side-by-side view
+│       ├── process.rs        # child-process spawning and stdout streaming
+│       ├── data.rs           # hex/station JSON loading
+│       └── palette.rs        # 16-color district palette
 ├── optimizer/
 │   ├── mod.rs               # Solver trait, Problem/Solution/CandidateStation types, JSON writers
 │   ├── greedy.rs            # Greedy p-median solver (candidate-based + hex fallback)
@@ -134,6 +147,9 @@ cargo run --bin dispatch_sim -- config/city.toml
 
 # Step 3 — report
 cargo run --bin dispatch_sim -- report output/dispatch_sim.db
+
+# Or use the dashboard GUI (runs all steps via buttons)
+cargo run --bin dashboard
 ```
 
 ### Test
@@ -259,6 +275,7 @@ Prints a terminal summary covering:
 
 - **Simulation overview** — duration, total events logged
 - **Incidents** — spawned, resolved, open/queued count
+- **SLA compliance** — city-wide and per-district compliance % for Priority A (≤5 min), B (≤15 min), C (≤60 min)
 - **Response time per district** — N, mean, P50, P95, max (spawn → unit arrival, minutes)
 - **On-scene duration** — mean, P50, P95, max (arrival → resolved)
 - **Unit utilisation per district** — average, min, and max busy % per unit
@@ -288,4 +305,5 @@ Prints a terminal summary covering:
 | `geo` | Polygon containment (H3 cell generation) |
 | `rusqlite` | SQLite event log |
 | `rand` / `rand_distr` | Exponential inter-arrival sampling |
+| `eframe` / `egui` | Dashboard GUI (GPU-accelerated immediate-mode) |
 | `serde` / `toml` / `serde_json` | Config and data serialisation |

@@ -243,61 +243,8 @@ impl City {
             })
             .collect();
 
-        // 5. Detect border nodes using H3 cell adjacency (grid_disk(1)).
-        let mut cell_to_district: HashMap<u64, DistrictId> = HashMap::new();
-        for d in &districts {
-            for h in &d.hexes {
-                cell_to_district.insert(h.h3_index, d.id);
-            }
-        }
-
-        for d in &mut districts {
-            let mut borders: Vec<BorderNode> = Vec::new();
-            for h in &d.hexes {
-                if let Ok(cell) = CellIndex::try_from(h.h3_index) {
-                    let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
-                    for nbr in disk {
-                        let nbr_u64 = u64::from(nbr);
-                        if let Some(&fid) = cell_to_district.get(&nbr_u64) {
-                            if fid != d.id {
-                                borders.push(BorderNode {
-                                    node_id:            h.node_id(),
-                                    neighbour_district: fid,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            borders.dedup_by_key(|b| (b.node_id, b.neighbour_district));
-            d.border_nodes = borders;
-        }
-
-        // 6. Seed ShiftChange events (one per district at t=0).
-        let mut event_heap: BinaryHeap<Reverse<SimEvent>> = BinaryHeap::new();
-        for district in &districts {
-            event_heap.push(Reverse(SimEvent::ShiftChange {
-                time:        SimTime(0),
-                district_id: district.id,
-            }));
-        }
-
-        // 7. Seed IncidentSpawn events (one per hex, staggered).
-        for district in &districts {
-            for hex in &district.hexes {
-                let first_time = crate::spawner::next_spawn_time(
-                    SimTime(0),
-                    &hex.spawn_profile_id,
-                    &profiles,
-                    &mut seed_rng,
-                );
-                event_heap.push(Reverse(SimEvent::IncidentSpawn {
-                    time:        first_time,
-                    hex_id:      hex.id,
-                    district_id: district.id,
-                }));
-            }
-        }
+        detect_border_nodes(&mut districts);
+        let event_heap = seed_events(&districts, &profiles, &mut seed_rng);
 
         std::fs::create_dir_all("./output").expect("could not create output directory");
 
@@ -388,4 +335,72 @@ fn parse_incident_kind(s: &str) -> IncidentKind {
             other
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Extracted from_config helpers
+// ---------------------------------------------------------------------------
+
+/// Detect border nodes using H3 cell adjacency (grid_disk(1)).
+fn detect_border_nodes(districts: &mut [District]) {
+    let mut cell_to_district: HashMap<u64, DistrictId> = HashMap::new();
+    for d in districts.iter() {
+        for h in &d.hexes {
+            cell_to_district.insert(h.h3_index, d.id);
+        }
+    }
+
+    for d in districts.iter_mut() {
+        let mut borders: Vec<BorderNode> = Vec::new();
+        for h in &d.hexes {
+            if let Ok(cell) = CellIndex::try_from(h.h3_index) {
+                let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
+                for nbr in disk {
+                    let nbr_u64 = u64::from(nbr);
+                    if let Some(&fid) = cell_to_district.get(&nbr_u64) {
+                        if fid != d.id {
+                            borders.push(BorderNode {
+                                node_id:            h.node_id(),
+                                neighbour_district: fid,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        borders.dedup_by_key(|b| (b.node_id, b.neighbour_district));
+        d.border_nodes = borders;
+    }
+}
+
+/// Seed the initial event heap with ShiftChange and IncidentSpawn events.
+fn seed_events(
+    districts: &[District],
+    profiles: &HashMap<SpawnProfileId, SpawnProfile>,
+    rng: &mut SmallRng,
+) -> BinaryHeap<Reverse<SimEvent>> {
+    let mut heap: BinaryHeap<Reverse<SimEvent>> = BinaryHeap::new();
+
+    for district in districts {
+        heap.push(Reverse(SimEvent::ShiftChange {
+            time:        SimTime(0),
+            district_id: district.id,
+        }));
+
+        for hex in &district.hexes {
+            let first_time = crate::spawner::next_spawn_time(
+                SimTime(0),
+                &hex.spawn_profile_id,
+                profiles,
+                rng,
+            );
+            heap.push(Reverse(SimEvent::IncidentSpawn {
+                time:        first_time,
+                hex_id:      hex.id,
+                district_id: district.id,
+            }));
+        }
+    }
+
+    heap
 }
