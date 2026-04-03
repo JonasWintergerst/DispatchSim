@@ -7,7 +7,9 @@
 # Source basis: German Polizeieinsatzstatistik / APCO/IACP benchmarks
 #   ~300 dispatched calls/day  (≈ 1 per 1 000 residents/day, typical DE/EU)
 #   ~12.7 calls/hour at baseline multipliers = 1.0
-#   23 patrol units → expected utilisation ≈ 38 % at avg 42 min on-scene
+#   80 patrol units → expected utilisation ≈ 16 % at avg 60 min total engagement
+#   (travel + on-scene + return; 300 calls/day, load = 300/(80×24) = 15.6 %)
+#   Range: PK 15 = 7 units (Reeperbahn peak) → outer suburban PKs = 2 units
 #
 # Priority classification used (APCO CAD standard, also aligns with DE Einsatzklassen):
 #   Priority A  →  immediate / life threat  (P1 / Einsatz 1) — lights & sirens
@@ -50,12 +52,12 @@ lon_max = 10.330
 [[districts]]
 id         = 0
 name       = "PK 11"
-unit_count = 3
+unit_count = 7
 
 [[districts]]
 id         = 1
 name       = "PK 12"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 2
@@ -65,17 +67,17 @@ unit_count = 3
 [[districts]]
 id         = 3
 name       = "PK 14"
-unit_count = 3
+unit_count = 25
 
 [[districts]]
 id         = 4
 name       = "PK 15"
-unit_count = 5
+unit_count = 12
 
 [[districts]]
 id         = 5
 name       = "PK 16"
-unit_count = 3
+unit_count = 11
 
 [[districts]]
 id         = 6
@@ -85,47 +87,47 @@ unit_count = 3
 [[districts]]
 id         = 7
 name       = "PK 21"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 8
 name       = "PK 22"
-unit_count = 3
+unit_count = 8
 
 [[districts]]
 id         = 9
 name       = "PK 23"
-unit_count = 3
+unit_count = 8
 
 [[districts]]
 id         = 10
 name       = "PK 24"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 11
 name       = "PK 25"
-unit_count = 3
+unit_count = 8
 
 [[districts]]
 id         = 12
 name       = "PK 26"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 13
 name       = "PK 27"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 14
 name       = "PK 31"
-unit_count = 3
+unit_count = 6
 
 [[districts]]
 id         = 15
 name       = "PK 32"
-unit_count = 3
+unit_count = 6
 
 [[districts]]
 id         = 16
@@ -135,12 +137,12 @@ unit_count = 3
 [[districts]]
 id         = 17
 name       = "PK 34"
-unit_count = 3
+unit_count = 2
 
 [[districts]]
 id         = 18
 name       = "PK 35"
-unit_count = 3
+unit_count = 2
 
 [[districts]]
 id         = 19
@@ -150,12 +152,12 @@ unit_count = 3
 [[districts]]
 id         = 20
 name       = "PK 41"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 21
 name       = "PK 42"
-unit_count = 3
+unit_count = 4
 
 [[districts]]
 id         = 22
@@ -165,7 +167,7 @@ unit_count = 3
 [[districts]]
 id         = 23
 name       = "PK 46"
-unit_count = 3
+unit_count = 2
 
 # ---------------------------------------------------------------------------
 # Spawn profiles
