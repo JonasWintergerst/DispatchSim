@@ -7,7 +7,7 @@
 // p-median solver, and writes the result to hexes.json (path in optimize.toml).
 // The simulator binary then reads that file.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process;
 
@@ -241,22 +241,48 @@ fn main() {
     println!("  → {}×{} road-distance matrix built", m, n);
 
     // 7b. Build road-aware adjacency (filter H3 edges that cross water).
+    //     Batch single-source Dijkstra from each unique hex node (bounded to
+    //     a small radius), then use the lookup for O(1) adjacency checks.
     println!("Building road-aware adjacency…");
     let cell_map: HashMap<u64, usize> = hexes.iter().enumerate()
         .map(|(i, h)| (h.index, i)).collect();
 
+    // Collect unique hex OSM nodes and precompute bounded travel times from each.
+    // The bound of 10 min covers all possible H3 neighbor checks (neighbours are
+    // ~200 m apart; the max_time threshold is 3× haversine / 500 m/min, min 5 min).
+    let mut unique_hex_nodes: Vec<u32> = hexes.iter().map(|h| h.nearest_osm_node).collect();
+    unique_hex_nodes.sort();
+    unique_hex_nodes.dedup();
+    let hex_node_set: HashSet<NodeId> = unique_hex_nodes.iter()
+        .map(|&id| NodeId::new(id)).collect();
+
+    println!("  Precomputing bounded travel times from {} unique hex nodes…", unique_hex_nodes.len());
+    let hex_travel_times: HashMap<NodeId, HashMap<NodeId, u32>> = unique_hex_nodes
+        .par_iter()
+        .map(|&node_raw| {
+            let node = NodeId::new(node_raw);
+            let times = osm.bounded_single_source(node, &hex_node_set, 10);
+            (node, times)
+        })
+        .collect();
+    println!("  → {} bounded Dijkstra runs complete", unique_hex_nodes.len());
+
     let adj: Vec<Vec<usize>> = hexes.par_iter().enumerate().map(|(i, h)| {
         let Ok(cell) = CellIndex::try_from(h.index) else { return vec![]; };
+        let from = NodeId::new(h.nearest_osm_node);
+        let from_times = hex_travel_times.get(&from);
         cell.grid_disk::<Vec<_>>(1).iter()
             .filter_map(|nbr| cell_map.get(&u64::from(*nbr)).copied())
             .filter(|&j| j != i)
             .filter(|&j| {
-                let from = NodeId::new(h.nearest_osm_node);
-                let to   = NodeId::new(hexes[j].nearest_osm_node);
-                let hav  = haversine_m(h.lat, h.lon, hexes[j].lat, hexes[j].lon);
+                let to = NodeId::new(hexes[j].nearest_osm_node);
+                let hav = haversine_m(h.lat, h.lon, hexes[j].lat, hexes[j].lon);
                 // 3× haversine at 30 km/h (500 m/min), minimum 5 min.
                 let max_time = ((hav * 3.0) / 500.0) as u32;
-                osm.bounded_travel_time(from, to, max_time.max(5)).is_some()
+                from_times
+                    .and_then(|tt| tt.get(&to))
+                    .map(|&cost| cost <= max_time.max(5))
+                    .unwrap_or(false)
             })
             .collect()
     }).collect();

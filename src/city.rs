@@ -17,7 +17,7 @@ use crate::event_queue::SimEvent;
 use crate::geo_utils::haversine_m;
 use crate::hex::Hex;
 use crate::osm::OsmGraph;
-use crate::routing::{Edge, Node, RoadGraph, RoutingEngine};
+use crate::routing::{Edge, Node, RoadGraph, RoutingEngine, RoutingSnapshot};
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
 use crate::types::{
@@ -138,13 +138,20 @@ impl City {
             hexes_by_district.entry(hex_cfg.district_id).or_default().push(hex_cfg);
         }
 
-        // 3. Load OSM road graph (if configured)
-        let osm: Option<OsmGraph> = cfg.city.sim.osm_path.as_ref().map(|p| {
-            println!("Loading OSM road graph from: {}", p);
-            let g = OsmGraph::load(Path::new(p)).expect("failed to load OSM PBF");
-            println!("  → {} road nodes, {} edges", g.node_count(), g.edge_count());
-            g
-        });
+        // 3. Try to load routing cache; fall back to OSM if not available.
+        let cache_path = cfg.city.sim.routing_cache_path.as_deref();
+        let cached = cache_path.and_then(|p| load_routing_cache(p));
+
+        let osm: Option<OsmGraph> = if cached.is_some() {
+            None // skip OSM loading — we have cached routing
+        } else {
+            cfg.city.sim.osm_path.as_ref().map(|p| {
+                println!("Loading OSM road graph from: {}", p);
+                let g = OsmGraph::load(Path::new(p)).expect("failed to load OSM PBF");
+                println!("  → {} road nodes, {} edges", g.node_count(), g.edge_count());
+                g
+            })
+        };
 
         // 4. Build districts
         // Phase A: assign ID ranges and RNG seeds sequentially (preserves determinism).
@@ -179,15 +186,11 @@ impl City {
                 let mut unit_cursor  = setup.unit_id_start;
 
                 // Build Hex objects from config; use pre-snapped OSM node if available.
-                // When no OSM is configured, assign a synthetic NodeId from the cursor
-                // so that the H3-adjacency routing engine has stable, unique IDs.
-                let use_osm = osm.is_some();
+                let use_osm = osm.is_some() || cached.is_some();
                 let mut hexes: Vec<Hex> = hexes_by_district
                     .get(&district_cfg.id)
                     .map(|hs| hs.iter().map(|h| {
                         let node_id = h.nearest_osm_node.map(NodeId::new).or_else(|| {
-                            // If not using OSM, assign a synthetic cursor-based ID now.
-                            // If using OSM, leave as None — will be re-snapped below.
                             if use_osm { None } else { Some(NodeId::new(hex_cursor)) }
                         });
                         let hex_id = HexId::new(hex_cursor);
@@ -204,8 +207,20 @@ impl City {
                     }).collect())
                     .unwrap_or_default();
 
-                // Build routing engine: OSM-based if configured, else H3-adjacency.
-                let routing = if let Some(ref osm_graph) = osm {
+                // Build routing engine: from cache, from OSM, or H3-adjacency fallback.
+                let routing = if let Some(ref cache) = cached {
+                    // Restore hex node assignments from cache.
+                    if let Some(hex_nodes) = cache.hex_nodes.get(&district_cfg.id) {
+                        for hex in hexes.iter_mut() {
+                            if let Some(&node_id) = hex_nodes.get(&hex.h3_index) {
+                                hex.nearest_road_node = Some(NodeId::new(node_id));
+                            }
+                        }
+                    }
+                    let snap = cache.snapshots.get(&district_cfg.id)
+                        .expect("routing cache missing district");
+                    RoutingEngine::from_snapshot(snap.clone())
+                } else if let Some(ref osm_graph) = osm {
                     let lat_min = hexes.iter().map(|h| h.lat).fold(f64::MAX, f64::min);
                     let lat_max = hexes.iter().map(|h| h.lat).fold(f64::MIN, f64::max);
                     let lon_min = hexes.iter().map(|h| h.lon).fold(f64::MAX, f64::min);
@@ -215,7 +230,6 @@ impl City {
                         lat_min, lat_max, lon_min, lon_max, 0.02,
                     );
 
-                    // Re-snap any hex whose OSM node wasn't pre-computed by the optimizer.
                     let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
                     for hex in hexes.iter_mut() {
                         hex.nearest_road_node = Some(osm_graph.nearest_node(hex.lat, hex.lon));
@@ -255,6 +269,13 @@ impl City {
                 District::new(district_id, station, units, hexes, district_rng, routing, cfg.city.sim.record_routes)
             })
             .collect();
+
+        // Save routing cache if we built from OSM and a cache path is configured.
+        if cached.is_none() && osm.is_some() {
+            if let Some(path) = cache_path {
+                save_routing_cache(path, &districts);
+            }
+        }
 
         detect_border_nodes(&mut districts);
         let event_heap = seed_events(&districts, &profiles, &mut seed_rng);
@@ -424,4 +445,65 @@ fn seed_events(
     }
 
     heap
+}
+
+// ---------------------------------------------------------------------------
+// Routing cache (binary serialization)
+// ---------------------------------------------------------------------------
+
+/// In-memory representation of a loaded routing cache.
+struct LoadedRoutingCache {
+    /// district_id → RoutingSnapshot
+    snapshots: HashMap<u32, RoutingSnapshot>,
+    /// district_id → (h3_index → nearest_road_node raw id)
+    hex_nodes: HashMap<u32, HashMap<u64, u32>>,
+}
+
+/// On-disk format for the routing cache file.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RoutingCacheFile {
+    /// (district_id, snapshot, hex_node_assignments)
+    /// hex_node_assignments: Vec<(h3_index, nearest_road_node_raw)>
+    districts: Vec<(u32, RoutingSnapshot, Vec<(u64, u32)>)>,
+}
+
+fn load_routing_cache(path: &str) -> Option<LoadedRoutingCache> {
+    let data = std::fs::read(path).ok()?;
+    let (file, _): (RoutingCacheFile, _) = bincode::serde::decode_from_slice(
+        &data,
+        bincode::config::standard(),
+    ).ok()?;
+
+    println!("Loaded routing cache from: {} ({} districts)", path, file.districts.len());
+
+    let mut snapshots = HashMap::new();
+    let mut hex_nodes = HashMap::new();
+    for (did, snap, nodes) in file.districts {
+        snapshots.insert(did, snap);
+        hex_nodes.insert(did, nodes.into_iter().collect());
+    }
+    Some(LoadedRoutingCache { snapshots, hex_nodes })
+}
+
+fn save_routing_cache(path: &str, districts: &[District]) {
+    let file = RoutingCacheFile {
+        districts: districts.iter().map(|d| {
+            let snap = d.routing.to_snapshot();
+            let hex_nodes: Vec<(u64, u32)> = d.hexes.iter()
+                .filter_map(|h| {
+                    h.nearest_road_node.map(|n| (h.h3_index, n.value()))
+                })
+                .collect();
+            (d.id.value(), snap, hex_nodes)
+        }).collect(),
+    };
+
+    let data = bincode::serde::encode_to_vec(&file, bincode::config::standard())
+        .expect("failed to encode routing cache");
+
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, data).expect("failed to write routing cache");
+    println!("Saved routing cache to: {} ({} districts)", path, districts.len());
 }

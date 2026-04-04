@@ -32,6 +32,18 @@ pub struct Edge {
 pub type RoadGraph = Graph<Node, Edge>;
 
 // ---------------------------------------------------------------------------
+// Serializable snapshot for routing cache
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingSnapshot {
+    pub nodes: Vec<(u32, f64, f64)>,    // (node_id_raw, lon, lat)
+    pub edges: Vec<(u32, u32, u32)>,    // (from_id_raw, to_id_raw, travel_time_min)
+    pub times: Vec<(u32, u32, u32)>,    // (from_id_raw, to_id_raw, cost)
+    pub anchors: Vec<u32>,              // anchor node ID values
+}
+
+// ---------------------------------------------------------------------------
 // Routing engine (Phase 2a)
 // ---------------------------------------------------------------------------
 
@@ -183,6 +195,63 @@ impl RoutingEngine {
             let p = self.graph[nx].position;
             (p.x(), p.y()) // geo::Point stores (lon, lat)
         })
+    }
+
+    /// Extract a serializable snapshot of this engine's graph and precomputed times.
+    pub fn to_snapshot(&self) -> RoutingSnapshot {
+        let nodes: Vec<(u32, f64, f64)> = self.graph.node_indices().map(|nx| {
+            let n = &self.graph[nx];
+            (n.id.value(), n.position.x(), n.position.y()) // (id, lon, lat)
+        }).collect();
+
+        let edges: Vec<(u32, u32, u32)> = self.graph.edge_indices().map(|ex| {
+            let (a, b) = self.graph.edge_endpoints(ex).unwrap();
+            (self.graph[a].id.value(), self.graph[b].id.value(), self.graph[ex].travel_time_min)
+        }).collect();
+
+        let times: Vec<(u32, u32, u32)> = self.times.iter()
+            .map(|(&(from, to), &cost)| (from.value(), to.value(), cost))
+            .collect();
+
+        let anchors: Vec<u32> = {
+            let mut seen = HashSet::new();
+            self.times.keys()
+                .map(|(from, _)| from.value())
+                .filter(|id| seen.insert(*id))
+                .collect()
+        };
+
+        RoutingSnapshot { nodes, edges, times, anchors }
+    }
+
+    /// Reconstruct a RoutingEngine from a cached snapshot (no Dijkstra needed).
+    pub fn from_snapshot(snap: RoutingSnapshot) -> Self {
+        let mut graph = RoadGraph::new();
+        let mut id_to_nx: HashMap<u32, NodeIndex> = HashMap::with_capacity(snap.nodes.len());
+
+        for &(id_raw, lon, lat) in &snap.nodes {
+            let nx = graph.add_node(Node {
+                id: NodeId::new(id_raw),
+                position: Point::new(lon, lat),
+            });
+            id_to_nx.insert(id_raw, nx);
+        }
+
+        for &(from_raw, to_raw, tt) in &snap.edges {
+            if let (Some(&a), Some(&b)) = (id_to_nx.get(&from_raw), id_to_nx.get(&to_raw)) {
+                graph.add_edge(a, b, Edge { travel_time_min: tt });
+            }
+        }
+
+        let node_index: HashMap<NodeId, NodeIndex> = graph.node_indices()
+            .map(|nx| (graph[nx].id, nx))
+            .collect();
+
+        let times: HashMap<(NodeId, NodeId), u32> = snap.times.into_iter()
+            .map(|(f, t, c)| ((NodeId::new(f), NodeId::new(t)), c))
+            .collect();
+
+        Self { graph, node_index, times, routes: RwLock::new(HashMap::new()) }
     }
 
     fn compute_route(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {

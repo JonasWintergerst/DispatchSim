@@ -58,7 +58,7 @@ pub struct District {
     pending_queue:    BinaryHeap<PendingIncident>,
     incident_counter: u32,
     rng:              SmallRng,
-    routing:          RoutingEngine,
+    pub(crate) routing: RoutingEngine,
     record_routes:    bool,
 }
 

@@ -80,6 +80,10 @@ pub struct SimConfig {
     /// heatmap analysis. Disabled by default because A* is expensive.
     #[serde(default)]
     pub record_routes: bool,
+    /// Path to a binary routing cache file. When set, the sim writes precomputed
+    /// routing data on first run and loads it on subsequent runs, skipping OSM
+    /// parsing and Dijkstra precomputation.
+    pub routing_cache_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

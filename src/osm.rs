@@ -3,13 +3,14 @@
 // Assigns sequential internal NodeIds (u32) to all OSM nodes referenced by
 // highway ways.  OSM node IDs (i64/u64) are not exposed outside this module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use geo::{BoundingRect, Coord, LineString, Point, Polygon};
 use osmpbf::{Element, ElementReader, RelMemberType};
 use petgraph::algo::dijkstra;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use rstar::{RTree, RTreeObject, AABB, PointDistance};
 
 use crate::geo_utils::haversine_m;
@@ -236,6 +237,50 @@ impl OsmGraph {
         };
         let costs = dijkstra(&self.graph, from_nx, Some(to_nx), |e| e.weight().travel_time_min);
         costs.get(&to_nx).copied().filter(|&c| c <= max_cost)
+    }
+
+    /// Bounded single-source Dijkstra: returns travel times from `source` to
+    /// all nodes in `targets` reachable within `max_cost` minutes.
+    /// Stops exploring once all settled nodes exceed `max_cost`.
+    pub fn bounded_single_source(
+        &self,
+        source: NodeId,
+        targets: &HashSet<NodeId>,
+        max_cost: u32,
+    ) -> HashMap<NodeId, u32> {
+        let Some(&source_nx) = self.node_index.get(&source) else {
+            return HashMap::new();
+        };
+
+        let mut dist: HashMap<NodeIndex, u32> = HashMap::new();
+        let mut heap: BinaryHeap<std::cmp::Reverse<(u32, NodeIndex)>> = BinaryHeap::new();
+
+        dist.insert(source_nx, 0);
+        heap.push(std::cmp::Reverse((0, source_nx)));
+
+        let mut result: HashMap<NodeId, u32> = HashMap::new();
+
+        while let Some(std::cmp::Reverse((cost, nx))) = heap.pop() {
+            if cost > max_cost {
+                break; // all remaining nodes exceed bound
+            }
+            if cost > dist.get(&nx).copied().unwrap_or(u32::MAX) {
+                continue; // stale entry
+            }
+            let node_id = self.graph[nx].id;
+            if targets.contains(&node_id) {
+                result.insert(node_id, cost);
+            }
+            for edge in self.graph.edges(nx) {
+                let next = edge.target();
+                let next_cost = cost + edge.weight().travel_time_min;
+                if next_cost <= max_cost && next_cost < dist.get(&next).copied().unwrap_or(u32::MAX) {
+                    dist.insert(next, next_cost);
+                    heap.push(std::cmp::Reverse((next_cost, next)));
+                }
+            }
+        }
+        result
     }
 }
 
