@@ -8,6 +8,7 @@ use std::path::Path;
 
 use geo::{BoundingRect, Coord, LineString, Point, Polygon};
 use osmpbf::{Element, ElementReader, RelMemberType};
+use petgraph::algo::dijkstra;
 use petgraph::graph::NodeIndex;
 use rstar::{RTree, RTreeObject, AABB, PointDistance};
 
@@ -57,6 +58,8 @@ pub struct OsmGraph {
     rtree:  RTree<RTreeNode>,
     /// (NodeId, lat, lon) kept for bbox filtering in subgraph_for_bbox.
     node_positions: Vec<(NodeId, f64, f64)>,
+    /// NodeId → petgraph NodeIndex for Dijkstra queries.
+    node_index: HashMap<NodeId, NodeIndex>,
 }
 
 impl OsmGraph {
@@ -138,7 +141,12 @@ impl OsmGraph {
             node_positions.iter().map(|&(id, lat, lon)| RTreeNode { id, lat, lon }).collect()
         );
 
-        Ok(Self { graph, rtree, node_positions })
+        let node_index: HashMap<NodeId, NodeIndex> = graph
+            .node_indices()
+            .map(|nx| (graph[nx].id, nx))
+            .collect();
+
+        Ok(Self { graph, rtree, node_positions, node_index })
     }
 
     /// Nearest road node to (lat, lon). O(log n) via R-tree.
@@ -204,6 +212,30 @@ impl OsmGraph {
         let sccs = kosaraju_scc(&self.graph);
         let largest = sccs.into_iter().max_by_key(|c| c.len()).unwrap_or_default();
         largest.into_iter().map(|nx| self.graph[nx].id).collect()
+    }
+
+    /// Dijkstra from `source` to all reachable nodes.
+    /// Returns NodeId → travel_time_min for every reachable node.
+    pub fn single_source_travel_times(&self, source: NodeId) -> HashMap<NodeId, u32> {
+        let Some(&source_nx) = self.node_index.get(&source) else {
+            return HashMap::new();
+        };
+        dijkstra(&self.graph, source_nx, None, |e| e.weight().travel_time_min)
+            .into_iter()
+            .map(|(nx, cost)| (self.graph[nx].id, cost))
+            .collect()
+    }
+
+    /// Bounded Dijkstra: returns `Some(cost)` if `to` is reachable from `from`
+    /// within `max_cost` travel-time minutes, `None` otherwise.
+    pub fn bounded_travel_time(&self, from: NodeId, to: NodeId, max_cost: u32) -> Option<u32> {
+        let (Some(&from_nx), Some(&to_nx)) =
+            (self.node_index.get(&from), self.node_index.get(&to))
+        else {
+            return None;
+        };
+        let costs = dijkstra(&self.graph, from_nx, Some(to_nx), |e| e.weight().travel_time_min);
+        costs.get(&to_nx).copied().filter(|&c| c <= max_cost)
     }
 }
 

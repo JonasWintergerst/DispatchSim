@@ -39,7 +39,14 @@ impl super::Solver for GreedySolver {
 
         // Dispatch to candidate-based or hex-based path.
         if !problem.candidate_stations.is_empty() {
-            return solve_candidate_based(hexes, &problem.candidate_stations, n, p, &problem.constraints);
+            return solve_candidate_based(
+                hexes,
+                &problem.candidate_stations,
+                n, p,
+                &problem.constraints,
+                problem.distance_matrix.as_deref(),
+                problem.adjacency_override.as_ref(),
+            );
         }
 
         // --- Hex-based fallback (any hex can be a station) ---
@@ -94,8 +101,13 @@ impl super::Solver for GreedySolver {
             .collect();
 
         // Precompute adjacency list once; reused by both repair phases.
-        let cell_map = build_cell_map(hexes);
-        let adj      = build_adjacency(hexes, &cell_map);
+        let adj = match &problem.adjacency_override {
+            Some(a) => a.clone(),
+            None => {
+                let cell_map = build_cell_map(hexes);
+                build_adjacency(hexes, &cell_map)
+            }
+        };
 
         // In the hex-based path the station hex IS the anchor hex.
         let anchors = station_indices.clone();
@@ -120,11 +132,13 @@ impl super::Solver for GreedySolver {
 // ---------------------------------------------------------------------------
 
 fn solve_candidate_based(
-    hexes:       &[H3Hex],
-    candidates:  &[CandidateStation],
-    n:           usize,
-    p:           usize,
-    constraints: &super::Constraints,
+    hexes:              &[H3Hex],
+    candidates:         &[CandidateStation],
+    n:                  usize,
+    p:                  usize,
+    constraints:        &super::Constraints,
+    distance_matrix:    Option<&[f64]>,
+    adjacency_override: Option<&Vec<Vec<usize>>>,
 ) -> Result<Solution, super::OptimizerError> {
     let m = candidates.len();
 
@@ -134,16 +148,22 @@ fn solve_candidate_based(
         )));
     }
 
-    // 1. Build m×n distance matrix: dist_cs[c * n + h] = haversine(candidate_c, hex_h).
-    println!("  Building {}×{} candidate-to-hex distance matrix…", m, n);
-    let dist_cs: Vec<f64> = (0..m)
-        .into_par_iter()
-        .flat_map(|c| {
-            (0..n)
-                .map(|h| haversine_m(candidates[c].lat, candidates[c].lon, hexes[h].lat, hexes[h].lon))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // 1. Build m×n distance matrix.
+    //    Use precomputed road-network distances if available, otherwise haversine.
+    let dist_cs: Vec<f64> = if let Some(dm) = distance_matrix {
+        println!("  Using precomputed {}×{} road-distance matrix", m, n);
+        dm.to_vec()
+    } else {
+        println!("  Building {}×{} candidate-to-hex distance matrix (haversine)…", m, n);
+        (0..m)
+            .into_par_iter()
+            .flat_map(|c| {
+                (0..n)
+                    .map(|h| haversine_m(candidates[c].lat, candidates[c].lon, hexes[h].lat, hexes[h].lon))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
 
     // 2. Greedy station selection over candidate set.
     let mut cost: Vec<f64> = hexes.iter().map(|h| h.spawn_rate * f64::MAX / 2.0).collect();
@@ -181,9 +201,14 @@ fn solve_candidate_based(
         })
         .collect();
 
-    // Precompute adjacency list.
-    let cell_map = build_cell_map(hexes);
-    let adj      = build_adjacency(hexes, &cell_map);
+    // Precompute adjacency list (use road-aware override if available).
+    let adj = match adjacency_override {
+        Some(a) => a.clone(),
+        None => {
+            let cell_map = build_cell_map(hexes);
+            build_adjacency(hexes, &cell_map)
+        }
+    };
 
     // Anchor hex per district = hex in the district closest to its selected candidate station.
     let anchors = compute_anchor_hexes(hexes, &assignments, &station_indices, candidates, n, p);
@@ -484,6 +509,8 @@ mod tests {
             n_districts: p,
             constraints: Constraints { contiguity: false, max_workload_ratio: None },
             objective:   ObjectiveWeights { travel_time: 1.0, workload_balance: 0.0 },
+            distance_matrix: None,
+            adjacency_override: None,
         }
     }
 

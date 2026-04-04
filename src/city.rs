@@ -117,7 +117,9 @@ impl City {
         }
     }
 
-    pub fn from_config(cfg: &LoadedConfig) -> Self {
+    /// Build a City with all districts, units, and routing from the loaded config.
+    /// `db_path` controls where the SQLite event log is written.
+    pub fn from_config_with_db(cfg: &LoadedConfig, db_path: &str) -> Self {
         let sim_type = cfg.city.sim.sim_type;
 
         // 1. Spawn profiles
@@ -257,13 +259,15 @@ impl City {
         detect_border_nodes(&mut districts);
         let event_heap = seed_events(&districts, &profiles, &mut seed_rng);
 
-        std::fs::create_dir_all("./output").expect("could not create output directory");
+        if let Some(parent) = Path::new(db_path).parent() {
+            std::fs::create_dir_all(parent).expect("could not create output directory");
+        }
 
         City {
             clock:         SimClock::new(),
             districts,
             event_heap,
-            event_log:     EventLog::open("./output/dispatch_sim.db")
+            event_log:     EventLog::open(db_path)
                                .expect("could not open event log"),
             event_buffer:  Vec::new(),
             route_buffer:  Vec::new(),
@@ -271,6 +275,11 @@ impl City {
             profiles,
             sim_type,
         }
+    }
+
+    /// Convenience wrapper using the default output path.
+    pub fn from_config(cfg: &LoadedConfig) -> Self {
+        Self::from_config_with_db(cfg, "./output/dispatch_sim.db")
     }
 }
 

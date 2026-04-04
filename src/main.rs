@@ -27,6 +27,11 @@ fn main() {
         return;
     }
 
+    if args.get(1).map(String::as_str) == Some("whatif") {
+        run_whatif(&args);
+        return;
+    }
+
     let config_path = resolve_config_path();
 
     println!("Loading config from: {}", config_path.display());
@@ -77,12 +82,14 @@ fn run(mut city: City, cfg: &LoadedConfig) {
         tick += 1;
 
         if tick % log_every == 0 {
+            let pct = (city.clock.elapsed_min as f64 / sim_end as f64) * 100.0;
             println!(
-                "  event {:>10} — sim time: day {}, {:02}:{:02}",
+                "  event {:>10} — sim time: day {}, {:02}:{:02} — {:.1}%",
                 tick,
                 city.clock.elapsed_min / 1440,
                 city.clock.hour_of_day(),
                 city.clock.elapsed_min % 60,
+                pct,
             );
         }
     }
@@ -91,6 +98,66 @@ fn run(mut city: City, cfg: &LoadedConfig) {
 
     let time = now.elapsed().as_millis() as i32;
     println!("Sim complete in: {}ms — {} events processed.", time, tick);
+}
+
+// ---------------------------------------------------------------------------
+// What-if unit reallocation
+// ---------------------------------------------------------------------------
+
+fn run_whatif(args: &[String]) {
+    use dispatch_sim::whatif::{generate_reallocation_variants, run_variant, print_comparison_table};
+
+    let config_path = args.get(2).map(String::as_str).unwrap_or("config/city.toml");
+    let max_variants: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let delta: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
+    // Optional: shorter sim duration for fast iteration (in minutes)
+    let sim_duration: Option<u64> = args.get(5).and_then(|s| s.parse().ok());
+
+    let cfg = dispatch_sim::config::LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+
+    let base_counts: Vec<(u32, String, u32)> = cfg.city.districts
+        .iter()
+        .map(|d| (d.id, d.name.clone(), d.unit_count))
+        .collect();
+
+    let total: u32 = base_counts.iter().map(|(_, _, c)| c).sum();
+    println!("What-If Unit Reallocation");
+    println!("  Config:       {config_path}");
+    println!("  Districts:    {}", base_counts.len());
+    println!("  Total units:  {total}");
+    println!("  Delta:        ±{delta} units per transfer");
+    println!("  Max variants: {max_variants}");
+    if let Some(d) = sim_duration {
+        println!("  Sim duration: {d} min (shortened)");
+    }
+
+    let variants = generate_reallocation_variants(&base_counts, delta, max_variants);
+    println!("\nGenerated {} variants. Running simulations…\n", variants.len());
+
+    let config_p = Path::new(config_path);
+    let mut results = Vec::new();
+
+    for (i, variant) in variants.iter().enumerate() {
+        let db_path = format!("./output/whatif_{i}.db");
+        print!("  [{}/{}] {:<40} … ", i + 1, variants.len(), variant.name);
+
+        let now = Instant::now();
+        match run_variant(config_p, variant, &db_path, sim_duration) {
+            Ok(r) => {
+                let elapsed = now.elapsed().as_secs();
+                println!("done ({elapsed}s) — SLA overall: {:.1}%", r.overall_sla_pct());
+                results.push(r);
+            }
+            Err(e) => {
+                println!("FAILED: {e}");
+            }
+        }
+    }
+
+    print_comparison_table(&mut results);
 }
 
 // ---------------------------------------------------------------------------

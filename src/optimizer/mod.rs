@@ -37,6 +37,12 @@ pub struct Problem {
     pub n_districts:        usize,
     pub constraints:        Constraints,
     pub objective:          ObjectiveWeights,
+    /// Precomputed candidate-to-hex distance matrix (flat row-major, m×n).
+    /// If Some, used instead of haversine. Values are in travel-time minutes.
+    pub distance_matrix:    Option<Vec<f64>>,
+    /// Road-aware adjacency list. If Some, used instead of H3 grid adjacency
+    /// for contiguity and workload repair.
+    pub adjacency_override: Option<Vec<Vec<usize>>>,
 }
 
 /// A single H3 cell — the unit of spatial analysis in the optimizer.

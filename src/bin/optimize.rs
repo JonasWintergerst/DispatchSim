@@ -11,10 +11,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process;
 
-use h3o::Resolution;
+use h3o::{CellIndex, Resolution};
 use serde::Deserialize;
 
 use dispatch_sim::config::SpawnProfileConfig;
+use dispatch_sim::geo_utils::haversine_m;
+use dispatch_sim::types::NodeId;
 use rayon::prelude::*;
 
 use dispatch_sim::optimizer::{self, CandidateStation, Constraints, H3Hex, ObjectiveWeights, Problem, Solver};
@@ -217,7 +219,50 @@ fn main() {
     }).collect();
     println!("  → candidates snapped to OSM road network");
 
-    // 7. Build problem.
+    // 7a. Precompute road travel times from each candidate station (Dijkstra).
+    let m = candidates.len();
+    let n = hexes.len();
+    println!("Computing road travel times from {} candidates to {} hexes…", m, n);
+    let station_travel_times: Vec<HashMap<NodeId, u32>> = candidates.par_iter()
+        .map(|c| osm.single_source_travel_times(NodeId::new(c.nearest_osm_node)))
+        .collect();
+
+    let mut dist_cs: Vec<f64> = Vec::with_capacity(m * n);
+    for c in 0..m {
+        let tt = &station_travel_times[c];
+        for h in 0..n {
+            let node = NodeId::new(hexes[h].nearest_osm_node);
+            let d = tt.get(&node)
+                .map(|&t| t as f64)
+                .unwrap_or(f64::MAX / 2.0); // unreachable → effectively infinite
+            dist_cs.push(d);
+        }
+    }
+    println!("  → {}×{} road-distance matrix built", m, n);
+
+    // 7b. Build road-aware adjacency (filter H3 edges that cross water).
+    println!("Building road-aware adjacency…");
+    let cell_map: HashMap<u64, usize> = hexes.iter().enumerate()
+        .map(|(i, h)| (h.index, i)).collect();
+
+    let adj: Vec<Vec<usize>> = hexes.par_iter().enumerate().map(|(i, h)| {
+        let Ok(cell) = CellIndex::try_from(h.index) else { return vec![]; };
+        cell.grid_disk::<Vec<_>>(1).iter()
+            .filter_map(|nbr| cell_map.get(&u64::from(*nbr)).copied())
+            .filter(|&j| j != i)
+            .filter(|&j| {
+                let from = NodeId::new(h.nearest_osm_node);
+                let to   = NodeId::new(hexes[j].nearest_osm_node);
+                let hav  = haversine_m(h.lat, h.lon, hexes[j].lat, hexes[j].lon);
+                // 3× haversine at 30 km/h (500 m/min), minimum 5 min.
+                let max_time = ((hav * 3.0) / 500.0) as u32;
+                osm.bounded_travel_time(from, to, max_time.max(5)).is_some()
+            })
+            .collect()
+    }).collect();
+    println!("  → adjacency filtered");
+
+    // 7c. Build problem.
     let problem = Problem {
         hexes,
         candidate_stations: candidates,
@@ -230,6 +275,8 @@ fn main() {
             travel_time:      cfg.objective.travel_time_weight,
             workload_balance: cfg.objective.workload_balance_weight,
         },
+        distance_matrix:    Some(dist_cs),
+        adjacency_override: Some(adj),
     };
 
     // 8. Select and run solver.

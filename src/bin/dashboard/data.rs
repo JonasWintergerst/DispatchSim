@@ -75,6 +75,35 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * R * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
+/// Load district unit allocations from city.toml for the what-if editor.
+/// Returns (district_id, name, unit_count) tuples.
+pub fn load_district_allocations() -> Vec<(u32, String, u32)> {
+    let path = "config/city.toml";
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Partial {
+        districts: Option<Vec<DistrictAlloc>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct DistrictAlloc {
+        id: u32,
+        name: String,
+        unit_count: u32,
+    }
+
+    let parsed: Partial = toml::from_str(&raw).unwrap_or(Partial { districts: None });
+    parsed
+        .districts
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| (d.id, d.name, d.unit_count))
+        .collect()
+}
+
 pub fn bounds(hexes: &[HexEntry]) -> ((f64, f64), (f64, f64)) {
     if hexes.is_empty() {
         return ((0.0, 1.0), (0.0, 1.0));

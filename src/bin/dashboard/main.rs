@@ -6,10 +6,12 @@ mod map_tab;
 mod palette;
 mod process;
 mod reports_tab;
+mod whatif_tab;
 
 use data::{HexEntry, StationEntry};
 use process::{is_progress_line, spawn_with_live_stdout, RunningProcess};
 use reports_tab::SavedReport;
+use whatif_tab::{WhatIfVariant, WhatIfResult};
 
 // ── Tab enum ─────────────────────────────────────────────────────────────────
 
@@ -17,6 +19,7 @@ use reports_tab::SavedReport;
 enum ActiveTab {
     Map,
     Reports,
+    WhatIf,
 }
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -28,6 +31,7 @@ struct DashboardApp {
     lon_range: (f64, f64),
     status: String,
     live_output: String,
+    sim_progress: f32,
     process: Option<RunningProcess>,
     report_text: Option<String>,
 
@@ -42,6 +46,23 @@ struct DashboardApp {
     report_name_input: String,
     viewing: Option<usize>,
     comparing: Option<usize>,
+
+    // ── What-If tab ──────────────────────────────────────────────────────
+    /// Baseline allocation loaded from city.toml (district_id, name, unit_count)
+    whatif_baseline: Vec<(u32, String, u32)>,
+    /// Current allocation being edited
+    whatif_current_alloc: Vec<(u32, String, u32)>,
+    whatif_variant_name: String,
+    whatif_variants: Vec<WhatIfVariant>,
+    whatif_results: Vec<WhatIfResult>,
+    whatif_raw_output: Option<String>,
+    whatif_running: bool,
+    whatif_progress: String,
+    whatif_captured_output: String,
+    whatif_delta: u32,
+    whatif_max_variants: usize,
+    whatif_short_sim: bool,
+    whatif_sim_duration: u64,
 }
 
 impl DashboardApp {
@@ -54,6 +75,8 @@ impl DashboardApp {
             .iter()
             .map(|h| data::min_travel_min(h.lat, h.lon, &district_stations))
             .collect();
+        let baseline_alloc = data::load_district_allocations();
+        let current_alloc = baseline_alloc.clone();
         Self {
             hexes,
             stations,
@@ -61,6 +84,7 @@ impl DashboardApp {
             lon_range,
             status: "Ready.".into(),
             live_output: String::new(),
+            sim_progress: 0.0,
             process: None,
             report_text: None,
             isochrone_minutes,
@@ -70,35 +94,62 @@ impl DashboardApp {
             report_name_input: "Run 1".into(),
             viewing: None,
             comparing: None,
+            whatif_baseline: baseline_alloc,
+            whatif_current_alloc: current_alloc,
+            whatif_variant_name: "Variant 1".into(),
+            whatif_variants: Vec::new(),
+            whatif_results: Vec::new(),
+            whatif_raw_output: None,
+            whatif_running: false,
+            whatif_progress: String::new(),
+            whatif_captured_output: String::new(),
+            whatif_delta: 2,
+            whatif_max_variants: 10,
+            whatif_short_sim: true,
+            whatif_sim_duration: 43_200, // 30 days
         }
     }
 
     fn poll_process(&mut self) {
         let Some(proc) = &mut self.process else { return };
 
+        // Collect lines to avoid overlapping borrows on self.
+        let mut lines = Vec::new();
         while let Ok(line) = proc.stdout_rx.try_recv() {
-            let trimmed = line.trim().to_owned();
-            if is_progress_line(&trimmed) {
-                self.live_output = trimmed;
-            }
+            lines.push(line);
         }
 
-        match proc.child.try_wait() {
-            Ok(Some(exit)) => {
-                self.status = if exit.success() {
-                    "Done.".into()
-                } else {
-                    format!("Exited with status {exit}")
-                };
-                self.live_output.clear();
-                self.process = None;
-            }
-            Ok(None) => {}
+        let finished = match proc.child.try_wait() {
+            Ok(Some(exit)) => Some(exit.success()),
+            Ok(None) => None,
             Err(e) => {
                 self.status = format!("Error polling process: {e}");
                 self.live_output.clear();
                 self.process = None;
+                if self.whatif_running { self.finalize_whatif(); }
+                return;
             }
+        };
+
+        // Process collected lines.
+        for line in &lines {
+            let trimmed = line.trim();
+            if self.whatif_running {
+                self.poll_whatif_output(trimmed);
+            } else if is_progress_line(trimmed) {
+                if let Some(pct) = parse_sim_progress(trimmed) {
+                    self.sim_progress = pct;
+                }
+                self.live_output = trimmed.to_owned();
+            }
+        }
+
+        if let Some(ok) = finished {
+            if self.whatif_running { self.finalize_whatif(); }
+            self.status = if ok { "Done.".into() } else { "Process failed.".into() };
+            self.live_output.clear();
+            self.sim_progress = 0.0;
+            self.process = None;
         }
     }
 
@@ -179,6 +230,7 @@ impl eframe::App for DashboardApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Map,     "🗺 Map");
                 ui.selectable_value(&mut self.active_tab, ActiveTab::Reports, "📊 Reports");
+                ui.selectable_value(&mut self.active_tab, ActiveTab::WhatIf, "🔀 What-If");
                 ui.separator();
 
                 let busy = self.process.is_some();
@@ -193,7 +245,14 @@ impl eframe::App for DashboardApp {
                 ui.separator();
                 ui.label(&self.status);
 
-                if !self.live_output.is_empty() {
+                if self.sim_progress > 0.0 {
+                    ui.separator();
+                    ui.add(
+                        egui::ProgressBar::new(self.sim_progress)
+                            .desired_width(200.0)
+                            .show_percentage(),
+                    );
+                } else if !self.live_output.is_empty() {
                     ui.separator();
                     ui.label(
                         egui::RichText::new(&self.live_output)
@@ -208,8 +267,19 @@ impl eframe::App for DashboardApp {
         match self.active_tab {
             ActiveTab::Map => self.show_map_tab(ctx),
             ActiveTab::Reports => self.show_reports_tab(ctx),
+            ActiveTab::WhatIf => self.show_whatif_tab(ctx),
         }
     }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Parse a trailing `— 12.5%` from a sim progress line; returns 0.0–1.0.
+fn parse_sim_progress(line: &str) -> Option<f32> {
+    let pct_end = line.rfind('%')?;
+    let before = &line[..pct_end];
+    let num_start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.')? + 1;
+    before[num_start..].parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.0, 1.0))
 }
 
 // ── Entry point ──────────────────────────────────────────────────────────────
