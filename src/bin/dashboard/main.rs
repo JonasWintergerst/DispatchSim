@@ -9,7 +9,7 @@ mod reports_tab;
 mod whatif_tab;
 
 use data::{HexEntry, StationEntry};
-use process::{is_progress_line, spawn_with_live_stdout, RunningProcess};
+use process::{spawn_with_live_stdout, ProcessKind, RunningProcess};
 use reports_tab::SavedReport;
 use whatif_tab::{WhatIfVariant, WhatIfResult};
 
@@ -125,6 +125,7 @@ impl DashboardApp {
 
     fn poll_process(&mut self) {
         let Some(proc) = &mut self.process else { return };
+        let kind = proc.kind;
 
         // Collect lines to avoid overlapping borrows on self.
         let mut lines = Vec::new();
@@ -144,24 +145,38 @@ impl DashboardApp {
             }
         };
 
-        // Process collected lines.
+        // Route stdout lines to the right parser based on which subprocess
+        // this is. Each kind has its own line format.
         for line in &lines {
             let trimmed = line.trim();
-            if self.whatif_running {
-                self.poll_whatif_output(trimmed);
-            } else if is_progress_line(trimmed) {
-                if let Some(pct) = parse_sim_progress(trimmed) {
-                    self.sim_progress = pct;
+            match kind {
+                ProcessKind::WhatIf | ProcessKind::WhatIfPatrol => {
+                    self.poll_whatif_output(trimmed);
                 }
-                self.live_output = trimmed.to_owned();
+                ProcessKind::Simulate => {
+                    // SimBatch::run prints "  [  1/  1] <name>  sim  50.0%"
+                    if let Some(pct) = parse_sim_progress(trimmed) {
+                        self.sim_progress = pct;
+                        self.live_output = trimmed.to_owned();
+                    }
+                }
+                ProcessKind::Optimize => {
+                    if trimmed.starts_with("Station ") && trimmed.contains("selected") {
+                        self.live_output = trimmed.to_owned();
+                    }
+                }
+                ProcessKind::PatrolGen => {
+                    if !trimmed.is_empty() {
+                        self.live_output = trimmed.to_owned();
+                    }
+                }
             }
         }
 
         if let Some(ok) = finished {
-            let was_patrol_gen = self.status.starts_with("Generating patrol routes");
-            let was_whatif = self.whatif_running;
             let was_stopped = self.stop_requested;
-            if self.whatif_running { self.finalize_whatif(); }
+            let was_whatif = matches!(kind, ProcessKind::WhatIf | ProcessKind::WhatIfPatrol);
+            if was_whatif { self.finalize_whatif(); }
             self.status = if was_stopped {
                 "Stopped.".into()
             } else if ok {
@@ -173,14 +188,14 @@ impl DashboardApp {
             self.sim_progress = 0.0;
             self.process = None;
             self.stop_requested = false;
-            if was_patrol_gen && ok {
+            if kind == ProcessKind::PatrolGen && ok {
                 self.whatif_patrol_strategies = scan_patrol_strategies();
             }
             // After a stopped standard sim, surface whatever the simulator
             // committed to the SQLite DB so the user can see partial results.
-            // Whatif batches write per-variant DBs and aggregate via stdout,
-            // so the report path doesn't apply there.
-            if was_stopped && !was_whatif {
+            // Only the Simulate kind writes to output/dispatch_sim.db, so this
+            // path must NOT fire for stopped optimize/patrol_gen/whatif runs.
+            if was_stopped && kind == ProcessKind::Simulate {
                 self.run_report();
                 self.status = "Stopped — partial report ready.".into();
             }
@@ -220,7 +235,7 @@ impl DashboardApp {
         }
         let mut cmd = Command::new("cargo");
         cmd.args(["run", "--release", "--bin", "optimize", "--", "config/optimize.toml"]);
-        match spawn_with_live_stdout(cmd) {
+        match spawn_with_live_stdout(cmd, ProcessKind::Optimize) {
             Ok(p) => {
                 self.process = Some(p);
                 self.status = "Optimizer running…".into();
@@ -237,7 +252,7 @@ impl DashboardApp {
         }
         let mut cmd = Command::new("cargo");
         cmd.args(["run", "--release", "--bin", "dispatch_sim", "--", "config/city.toml"]);
-        match spawn_with_live_stdout(cmd) {
+        match spawn_with_live_stdout(cmd, ProcessKind::Simulate) {
             Ok(p) => {
                 self.process = Some(p);
                 self.status = "Simulation running…".into();

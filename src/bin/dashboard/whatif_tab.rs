@@ -2,7 +2,7 @@ use egui::{Color32, RichText};
 use std::process::{Command, Stdio};
 
 use crate::DashboardApp;
-use crate::process::spawn_with_live_stdout;
+use crate::process::{spawn_with_live_stdout, ProcessKind};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -308,7 +308,7 @@ impl DashboardApp {
         // Also capture stderr for cargo build output
         cmd.stderr(Stdio::piped());
 
-        match spawn_with_live_stdout(cmd) {
+        match spawn_with_live_stdout(cmd, ProcessKind::WhatIf) {
             Ok(p) => {
                 self.process = Some(p);
                 self.status = "What-if analysis running…".into();
@@ -356,7 +356,7 @@ impl DashboardApp {
         cmd.args(&args);
         cmd.stderr(Stdio::piped());
 
-        match spawn_with_live_stdout(cmd) {
+        match spawn_with_live_stdout(cmd, ProcessKind::WhatIfPatrol) {
             Ok(p) => {
                 self.process = Some(p);
                 self.status = "Patrol comparison running…".into();
@@ -384,7 +384,7 @@ impl DashboardApp {
             "config/city.toml", strategy,
         ]);
         cmd.stderr(Stdio::piped());
-        match spawn_with_live_stdout(cmd) {
+        match spawn_with_live_stdout(cmd, ProcessKind::PatrolGen) {
             Ok(p) => {
                 self.process = Some(p);
                 self.status = format!("Generating patrol routes ({strategy})…");
