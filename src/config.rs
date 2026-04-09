@@ -57,6 +57,17 @@ pub struct CityConfig {
     /// Spawn profiles referenced by spawn_profile_id in hexes.json.
     /// Key is the profile id string (e.g. "residential", "commercial").
     pub spawn_profiles: HashMap<String, SpawnProfileConfig>,
+
+    /// Optional patrol section. Absent → no patrols, units sit idle at their
+    /// stations between calls (the pre-Phase-2 behaviour).
+    #[serde(default)]
+    pub patrol: Option<PatrolConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PatrolConfig {
+    /// Path to a JSON file produced by `patrol_gen`. Loaded at city construction.
+    pub routes_path: Option<String>,
 }
 
 impl CityConfig {
@@ -84,6 +95,17 @@ pub struct SimConfig {
     /// routing data on first run and loads it on subsequent runs, skipping OSM
     /// parsing and Dijkstra precomputation.
     pub routing_cache_path: Option<String>,
+
+    /// Master switch for cross-district mutual aid. When `false` (or absent),
+    /// the sim behaves like the pre-Phase-2 simulator: incidents that can't
+    /// be served locally just queue up.
+    #[serde(default)]
+    pub mutual_aid_enabled: Option<bool>,
+
+    /// Maximum travel-time (minutes) at which a neighbour district's unit is
+    /// considered as a mutual-aid lender. Defaults to 8 min.
+    #[serde(default)]
+    pub mutual_aid_max_min: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +113,10 @@ pub struct DistrictConfig {
     pub id:         u32,
     pub name:       String,
     pub unit_count: u32,
+    /// How many of this district's units should be assigned a patrol route.
+    /// Defaults to 0 (all units station-bound).
+    #[serde(default)]
+    pub patrol_units: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]

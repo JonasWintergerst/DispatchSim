@@ -158,6 +158,57 @@ impl DashboardApp {
                 }
             });
 
+            // ── Patrol strategy comparison ──────────────────────────────
+            ui.add_space(8.0);
+            ui.separator();
+            egui::CollapsingHeader::new("Patrol Strategy Comparison")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.whatif_patrol_strategies.is_empty() {
+                        ui.weak("No patrol_routes_*.json files in config/.");
+                        ui.weak("Click a Generate button below to create one.");
+                    } else {
+                        for (label, path, enabled) in self.whatif_patrol_strategies.iter_mut() {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(enabled, label.as_str());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| { ui.weak(path.as_str()); },
+                                );
+                            });
+                        }
+                    }
+
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.whatif_mutual_aid, "Include mutual-aid variants");
+
+                    ui.add_space(4.0);
+                    ui.add_enabled_ui(!busy, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("Generate (hotspot)").clicked() {
+                                self.spawn_patrol_gen("hotspot");
+                            }
+                            if ui.button("Generate (border)").clicked() {
+                                self.spawn_patrol_gen("border");
+                            }
+                            if ui.button("↻ Rescan").clicked() {
+                                self.whatif_patrol_strategies = crate::scan_patrol_strategies();
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+                    let any_selected = self.whatif_patrol_strategies.iter().any(|(_, _, e)| *e);
+                    ui.add_enabled_ui(!busy && any_selected, |ui| {
+                        if ui.button("Run Patrol Comparison").clicked() {
+                            self.spawn_whatif_patrol();
+                        }
+                    });
+                    if !any_selected && !self.whatif_patrol_strategies.is_empty() {
+                        ui.weak("Tick at least one strategy to enable.");
+                    }
+                });
+
             // Progress
             if self.whatif_running {
                 ui.add_space(4.0);
@@ -268,6 +319,77 @@ impl DashboardApp {
                 self.whatif_captured_output.clear();
             }
             Err(e) => self.status = format!("Failed to start what-if: {e}"),
+        }
+    }
+
+    /// Spawn the patrol-strategy comparison: shells out to
+    /// `dispatch_sim whatif-patrol …` with one `--strategy <label>` per ticked
+    /// row and an optional `--no-aid` flag.
+    pub fn spawn_whatif_patrol(&mut self) {
+        if self.process.is_some() {
+            self.status = "A process is already running.".into();
+            return;
+        }
+
+        let mut cmd = Command::new("cargo");
+        let mut args: Vec<String> = vec![
+            "run".into(),
+            "--release".into(),
+            "--bin".into(),
+            "dispatch_sim".into(),
+            "--".into(),
+            "whatif-patrol".into(),
+            "config/city.toml".into(),
+        ];
+        for (label, _path, enabled) in &self.whatif_patrol_strategies {
+            if *enabled {
+                args.push("--strategy".into());
+                args.push(label.clone());
+            }
+        }
+        if !self.whatif_mutual_aid {
+            args.push("--no-aid".into());
+        }
+        if self.whatif_short_sim {
+            args.push(self.whatif_sim_duration.to_string());
+        }
+        cmd.args(&args);
+        cmd.stderr(Stdio::piped());
+
+        match spawn_with_live_stdout(cmd) {
+            Ok(p) => {
+                self.process = Some(p);
+                self.status = "Patrol comparison running…".into();
+                self.whatif_running = true;
+                self.whatif_progress = "Starting…".into();
+                self.whatif_results.clear();
+                self.whatif_raw_output = None;
+                self.whatif_captured_output.clear();
+            }
+            Err(e) => self.status = format!("Failed to start patrol comparison: {e}"),
+        }
+    }
+
+    /// Spawn the offline patrol-route generator for one strategy. The
+    /// strategy list is auto-rescanned when the process exits via
+    /// `finalize_whatif`'s caller path — see `poll_process` in main.rs.
+    pub fn spawn_patrol_gen(&mut self, strategy: &str) {
+        if self.process.is_some() {
+            self.status = "A process is already running.".into();
+            return;
+        }
+        let mut cmd = Command::new("cargo");
+        cmd.args([
+            "run", "--release", "--bin", "patrol_gen", "--",
+            "config/city.toml", strategy,
+        ]);
+        cmd.stderr(Stdio::piped());
+        match spawn_with_live_stdout(cmd) {
+            Ok(p) => {
+                self.process = Some(p);
+                self.status = format!("Generating patrol routes ({strategy})…");
+            }
+            Err(e) => self.status = format!("Failed to start patrol_gen: {e}"),
         }
     }
 

@@ -36,6 +36,17 @@ sim_type         = "Police"
 record_routes      = false
 osm_path           = "config/hamburg-260331.osm.pbf"
 routing_cache_path = "output/routing_cache.bin"
+# Phase 2 — cross-district mutual aid. When enabled, an incident with no local
+# unit available is offered to neighbour districts; the closest free unit
+# (within `mutual_aid_max_min` minutes) is loaned. Off by default to preserve
+# legacy behaviour.
+mutual_aid_enabled = false
+mutual_aid_max_min = 8
+
+# Phase 2 — patrols. Compiled-in once at startup; the per-district `patrol_units`
+# field below controls how many units in that district patrol when idle.
+[patrol]
+routes_path = "config/patrol_routes_hotspot.json"
 
 # Maps the abstract (col, row) hex grid onto Hamburg's geographic footprint.
 # row 0 = north (lat_max), row N = south (lat_min).

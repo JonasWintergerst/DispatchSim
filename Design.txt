@@ -1,0 +1,22 @@
+### 1. Planning Standards (The German Context)
+* **Legal Metric:** Design is driven by the *Hilfsfrist* (Response Time), aiming for the **95th percentile** (usually 10 minutes).
+* **Structure:** Modern systems use a hybrid of **H3 Hexagonal Grids** for demand/workload and **OSM Graphs** (nodes/edges) for routing.
+* **Workload:** Must balance "Reactive" calls (crimes) with "Proactive" time (patrols/paperwork).
+
+### 2. Software Architecture (Rust & H3)
+* **Resolution:** **H3 Res 9** (~174m) is the "sweet spot" for urban police planning, aligning well with official German census grids.
+* **Optimization vs. Simulation:** You are correctly using a two-stage approach:
+    * **Optimizer:** Sets deterministic boundaries based on workload and continuity.
+    * **Simulator:** Validates those boundaries using stochastic (random) 4-year event-based data.
+* **Continuity:** Best handled in Rust via **Graph Theory** (DFS/BFS) on the hex-adjacency map to ensure districts aren't fragmented.
+
+### 3. Simulation Logic & Performance
+* **Patrols:** Instead of "tick-based" movement, use **Event-Based Lazy Evaluation**. Calculate a unit's position only when an incident occurs based on its `start_time` and `path`.
+* **Event Handling:** Keep the simulation **Discrete Event-Based** to jump between status changes (Status 1 to 4) rather than processing every minute of idle time.
+* **Scaling:** Pre-calculating a **Hex-to-Hex Travel Time Matrix** is the single best way to make 4-year simulations run in seconds.
+
+### 4. Parallelization Strategy
+* **Efficiency:** Don't parallelize the internal logic of one simulation (too much overhead).
+* **Throughput:** Use **one thread per simulation** (e.g., via `rayon`). This allows a standard PC to test dozens or hundreds of different configurations (different unit counts or district shapes) in **under 60 minutes**.
+
+**Key Takeaway:** Your current "Big Picture" (Rust + H3 Res 9 + Event-Based Sim + Multi-scenario Batching) matches the high-performance requirements for professional strategic planning.

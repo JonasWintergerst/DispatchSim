@@ -63,6 +63,12 @@ struct DashboardApp {
     whatif_max_variants: usize,
     whatif_short_sim: bool,
     whatif_sim_duration: u64,
+
+    // ── Patrol strategy comparison ───────────────────────────────────────
+    /// (label, json_path, enabled) — discovered from config/patrol_routes_*.json
+    whatif_patrol_strategies: Vec<(String, String, bool)>,
+    /// When true, the patrol comparison includes the "+ aid" / "Mutual aid only" rows.
+    whatif_mutual_aid: bool,
 }
 
 impl DashboardApp {
@@ -107,6 +113,8 @@ impl DashboardApp {
             whatif_max_variants: 10,
             whatif_short_sim: true,
             whatif_sim_duration: 43_200, // 30 days
+            whatif_patrol_strategies: scan_patrol_strategies(),
+            whatif_mutual_aid: true,
         }
     }
 
@@ -145,11 +153,15 @@ impl DashboardApp {
         }
 
         if let Some(ok) = finished {
+            let was_patrol_gen = self.status.starts_with("Generating patrol routes");
             if self.whatif_running { self.finalize_whatif(); }
             self.status = if ok { "Done.".into() } else { "Process failed.".into() };
             self.live_output.clear();
             self.sim_progress = 0.0;
             self.process = None;
+            if was_patrol_gen && ok {
+                self.whatif_patrol_strategies = scan_patrol_strategies();
+            }
         }
     }
 
@@ -273,6 +285,23 @@ impl eframe::App for DashboardApp {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Scan `config/` for `patrol_routes_*.json` files. Returns
+/// `(label, path, enabled)` triples sorted by label, all enabled by default.
+pub fn scan_patrol_strategies() -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("config") else { return out };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if let Some(label) = stem.strip_prefix("patrol_routes_") {
+            out.push((label.to_string(), path.to_string_lossy().into_owned(), true));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
 
 /// Parse a trailing `— 12.5%` from a sim progress line; returns 0.0–1.0.
 fn parse_sim_progress(line: &str) -> Option<f32> {

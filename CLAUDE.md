@@ -97,7 +97,8 @@ Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` o
 ### Key Design Decisions
 
 - **Strong newtypes for all IDs** (`UnitId(u32)`, `IncidentId(String)`, etc.) — prevents accidental mixing at compile time
-- **Districts are the unit of parallelism** — each district processes its events independently; inter-district coordination (mutual aid) is stubbed via `DistrictMsg` inbox/outbox but not yet implemented
+- **Simulations are the unit of parallelism** — `City::tick` processes districts sequentially (they share no mutable state but per-tick Rayon overhead dominates). Throughput comes from running many whole simulations in parallel, one per thread, each reading from a shared `Arc<RoutingEngine>`. The what-if runner (`src/main.rs:run_whatif`) is the canonical example.
+- **Routing is precomputed in the optimizer, not the sim** — the optimizer builds per-district `RoutingEngine` subgraphs after districting and serialises them to `output/routing_cache.bin` via `src/routing_cache.rs`. The simulator refuses to start without this file; it does not load OSM itself. This means every sim invocation starts with zero routing work and many sim variants can be benchmarked cheaply against a single optimized district layout.
 - **`SimEvent` vs `Event`** — `SimEvent` drives future scheduling (heap); `Event` is an immutable log record written to SQLite
 
 ### Known Gaps / Planned Work
@@ -107,3 +108,4 @@ Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` o
 - Inter-district mutual aid is scaffolded (`DistrictMsg` in `types.rs`) but not wired up
 - `ratatui` (TUI) is a dependency planned for live visualization but not yet wired up
 - Optimizer uses haversine distance proxy for the p-median objective; a road-network travel-time matrix would give more accurate results but requires full Dijkstra over the OSM graph
+- Parallelization strategy (Design.txt §4): precompute routing once in the optimizer and parallelise across whole simulations (one thread per sim), not across districts within a sim. ✅ implemented — cache produced by `optimize`, consumed by `dispatch_sim` and `whatif` batch runner.

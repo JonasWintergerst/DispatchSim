@@ -1,28 +1,28 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use h3o::CellIndex;
-use petgraph::graph::NodeIndex;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::RngExt;
-use rayon::iter::{IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::clock::{SimClock, SimTime};
 use crate::config::{LoadedConfig, SpawnProfileConfig};
 use crate::district::District;
 use crate::event_log::{Event, EventLog, RouteRecord};
 use crate::event_queue::SimEvent;
-use crate::geo_utils::haversine_m;
 use crate::hex::Hex;
-use crate::osm::OsmGraph;
-use crate::routing::{Edge, Node, RoadGraph, RoutingEngine, RoutingSnapshot};
+use crate::patrol::{self, PatrolRouteSet};
+use crate::routing::RoutingEngine;
+use crate::routing_cache::{self, LoadedRoutingCache};
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
 use crate::types::{
-    BorderNode, DistrictId, HexId, IncidentKind, NodeId, SimType, SpawnProfileId, StationId,
-    UnitId,
+    BorderNode, DistrictId, HexId, IncidentKind, MutualAidRequest, NodeId, SimType,
+    SpawnProfileId, StationId, UnitId, UnitStatus,
 };
 use crate::unit::Unit;
 
@@ -39,6 +39,12 @@ pub struct City {
     next_flush:     u64,
     profiles:       HashMap<SpawnProfileId, SpawnProfile>,
     sim_type:       SimType,
+    /// Cap on travel time (minutes) for cross-district lending. Lender candidates
+    /// further than this from the requesting incident are skipped.
+    mutual_aid_max_min:  u32,
+    /// Master switch for the mutual-aid pass. Disabled → behaves exactly like
+    /// the pre-Phase-2 simulator.
+    mutual_aid_enabled:  bool,
 }
 
 impl City {
@@ -62,27 +68,27 @@ impl City {
 
         let profiles = &self.profiles;
 
-        // Use par_iter_mut only when multiple districts have concurrent events —
-        // for the common case (1 event, 1 district) the Rayon thread overhead
-        // dominates over the tiny amount of work.
-        let follow_on: Vec<(SimEvent, Event, Option<RouteRecord>)> = if district_batches.len() > 2 {
-            self.districts
-                .par_iter_mut()
-                .flat_map(|d| {
-                    let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
-                    d.process_events(batch, profiles)
-                })
-                .collect()
-        } else {
-            self.districts
-                .iter_mut()
-                .filter(|d| district_batches.contains_key(&d.id))
-                .flat_map(|d| {
-                    let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
-                    d.process_events(batch, profiles)
-                })
-                .collect()
-        };
+        // Tick is strictly sequential: districts share no mutable state, so
+        // parallelising across them is possible, but for a typical tick only
+        // 1–2 districts have co-scheduled events and Rayon's fork/join overhead
+        // dominates. Throughput comes from running whole sims in parallel
+        // (see `run_whatif` in main.rs), not from parallelising inside one sim.
+        let mut follow_on: Vec<(SimEvent, Event, Option<RouteRecord>)> = Vec::new();
+        let mut all_aid: Vec<MutualAidRequest> = Vec::new();
+        for d in self.districts.iter_mut() {
+            if !district_batches.contains_key(&d.id) { continue; }
+            let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
+            let mut out = d.process_events(batch, profiles);
+            follow_on.append(&mut out.events);
+            all_aid.append(&mut out.aid_requests);
+        }
+
+        // Mutual-aid pass — for every incident this tick that ended up in
+        // pending_queue, look for an idle/patrolling unit in a neighbour
+        // district and loan it. Skipped entirely when disabled.
+        if self.mutual_aid_enabled && !all_aid.is_empty() {
+            self.run_mutual_aid_pass(next_time, &all_aid, &mut follow_on);
+        }
 
         for (sim_ev, log_ev, route) in follow_on {
             if !matches!(sim_ev, SimEvent::NoOp) {
@@ -119,7 +125,43 @@ impl City {
 
     /// Build a City with all districts, units, and routing from the loaded config.
     /// `db_path` controls where the SQLite event log is written.
+    ///
+    /// Loads the routing cache from `cfg.city.sim.routing_cache_path`; the
+    /// optimizer is the sole producer of this file. Panics with a clear message
+    /// if the path is not configured or the file is missing.
     pub fn from_config_with_db(cfg: &LoadedConfig, db_path: &str) -> Self {
+        let cache_path = cfg.city.sim.routing_cache_path.as_deref().unwrap_or_else(|| {
+            panic!(
+                "sim.routing_cache_path is not set in city.toml — add e.g. \
+                 `routing_cache_path = \"output/routing_cache.bin\"` and run \
+                 `cargo run --bin optimize` to produce it"
+            );
+        });
+        let cached = Arc::new(routing_cache::load(cache_path).unwrap_or_else(|| {
+            panic!(
+                "routing cache not found at {cache_path} — run `cargo run --bin optimize` first"
+            );
+        }));
+
+        Self::build_from_cache(cfg, db_path, cached)
+    }
+
+    /// Build a City using an already-loaded routing cache. This is the shared
+    /// path for both `from_config_with_db` (single sim) and `run_whatif`
+    /// (many parallel sims sharing one Arc<LoadedRoutingCache>).
+    pub fn from_config_with_routing(
+        cfg:    &LoadedConfig,
+        db_path: &str,
+        cached:  Arc<LoadedRoutingCache>,
+    ) -> Self {
+        Self::build_from_cache(cfg, db_path, cached)
+    }
+
+    fn build_from_cache(
+        cfg:    &LoadedConfig,
+        db_path: &str,
+        cached:  Arc<LoadedRoutingCache>,
+    ) -> Self {
         let sim_type = cfg.city.sim.sim_type;
 
         // 1. Spawn profiles
@@ -137,21 +179,6 @@ impl City {
         for hex_cfg in &cfg.hex_grid.hexes {
             hexes_by_district.entry(hex_cfg.district_id).or_default().push(hex_cfg);
         }
-
-        // 3. Try to load routing cache; fall back to OSM if not available.
-        let cache_path = cfg.city.sim.routing_cache_path.as_deref();
-        let cached = cache_path.and_then(|p| load_routing_cache(p));
-
-        let osm: Option<OsmGraph> = if cached.is_some() {
-            None // skip OSM loading — we have cached routing
-        } else {
-            cfg.city.sim.osm_path.as_ref().map(|p| {
-                println!("Loading OSM road graph from: {}", p);
-                let g = OsmGraph::load(Path::new(p)).expect("failed to load OSM PBF");
-                println!("  → {} road nodes, {} edges", g.node_count(), g.edge_count());
-                g
-            })
-        };
 
         // 4. Build districts
         // Phase A: assign ID ranges and RNG seeds sequentially (preserves determinism).
@@ -172,7 +199,9 @@ impl City {
             s
         }).collect();
 
-        // Phase B: build each district in parallel (routing engines are independent).
+        // Phase B: build each district in parallel (cache lookups are independent,
+        // and each Arc::clone is cheap). The expensive Dijkstra work already
+        // happened in the optimizer; this loop just restores snapshots.
         let station_lookup = cfg.district_stations.by_district_id();
 
         let mut districts: Vec<District> = cfg.city.districts
@@ -185,14 +214,12 @@ impl City {
                 let mut hex_cursor   = setup.hex_id_start;
                 let mut unit_cursor  = setup.unit_id_start;
 
-                // Build Hex objects from config; use pre-snapped OSM node if available.
-                let use_osm = osm.is_some() || cached.is_some();
+                // Build Hex objects from config. Every hex must have an OSM node
+                // — either from hexes.json (optimizer's pre-snap) or from the
+                // routing cache (which the optimizer also wrote).
                 let mut hexes: Vec<Hex> = hexes_by_district
                     .get(&district_cfg.id)
                     .map(|hs| hs.iter().map(|h| {
-                        let node_id = h.nearest_osm_node.map(NodeId::new).or_else(|| {
-                            if use_osm { None } else { Some(NodeId::new(hex_cursor)) }
-                        });
                         let hex_id = HexId::new(hex_cursor);
                         hex_cursor += 1;
                         Hex {
@@ -202,46 +229,25 @@ impl City {
                             lon:               h.lon,
                             district:          district_id,
                             spawn_profile_id:  SpawnProfileId::new(h.spawn_profile_id.clone()),
-                            nearest_road_node: node_id,
+                            nearest_road_node: h.nearest_osm_node.map(NodeId::new),
                         }
                     }).collect())
                     .unwrap_or_default();
 
-                // Build routing engine: from cache, from OSM, or H3-adjacency fallback.
-                let routing = if let Some(ref cache) = cached {
-                    // Restore hex node assignments from cache.
-                    if let Some(hex_nodes) = cache.hex_nodes.get(&district_cfg.id) {
-                        for hex in hexes.iter_mut() {
-                            if let Some(&node_id) = hex_nodes.get(&hex.h3_index) {
-                                hex.nearest_road_node = Some(NodeId::new(node_id));
-                            }
+                // Prefer the cache's per-hex OSM node map (it's what the cache
+                // snapshot's anchor set was built from, so this guarantees
+                // routing lookups hit the precomputed `times` table).
+                if let Some(hex_nodes) = cached.hex_nodes.get(&district_cfg.id) {
+                    for hex in hexes.iter_mut() {
+                        if let Some(&node_id) = hex_nodes.get(&hex.h3_index) {
+                            hex.nearest_road_node = Some(NodeId::new(node_id));
                         }
                     }
-                    let snap = cache.snapshots.get(&district_cfg.id)
-                        .expect("routing cache missing district");
-                    RoutingEngine::from_snapshot(snap.clone())
-                } else if let Some(ref osm_graph) = osm {
-                    let lat_min = hexes.iter().map(|h| h.lat).fold(f64::MAX, f64::min);
-                    let lat_max = hexes.iter().map(|h| h.lat).fold(f64::MIN, f64::max);
-                    let lon_min = hexes.iter().map(|h| h.lon).fold(f64::MAX, f64::min);
-                    let lon_max = hexes.iter().map(|h| h.lon).fold(f64::MIN, f64::max);
+                }
 
-                    let subgraph = osm_graph.subgraph_for_bbox(
-                        lat_min, lat_max, lon_min, lon_max, 0.02,
-                    );
-
-                    let mut anchors: Vec<NodeId> = Vec::with_capacity(hexes.len());
-                    for hex in hexes.iter_mut() {
-                        hex.nearest_road_node = Some(osm_graph.nearest_node(hex.lat, hex.lon));
-                        anchors.push(hex.nearest_road_node.unwrap());
-                    }
-                    anchors.sort();
-                    anchors.dedup();
-
-                    RoutingEngine::from_graph(subgraph, &anchors)
-                } else {
-                    build_h3_routing_engine(&hexes)
-                };
+                let snap = cached.snapshots.get(&district_cfg.id)
+                    .expect("routing cache missing district — rerun the optimizer");
+                let routing = Arc::new(RoutingEngine::from_snapshot(snap.clone()));
 
                 // Station location from districts.json (real OSM-snapped station node).
                 let district_station = station_lookup
@@ -270,14 +276,25 @@ impl City {
             })
             .collect();
 
-        // Save routing cache if we built from OSM and a cache path is configured.
-        if cached.is_none() && osm.is_some() {
-            if let Some(path) = cache_path {
-                save_routing_cache(path, &districts);
+        detect_border_nodes(&mut districts);
+
+        // Load patrol routes (if any) and assign them to the configured number
+        // of patrol units per district. Failures to load are non-fatal — we
+        // just log a warning and run without patrols, which preserves the
+        // pre-Phase-2 behaviour.
+        let patrol_assignments = load_patrol_assignments(cfg, &districts);
+        for d in districts.iter_mut() {
+            if let Some((routes, n_patrol_units)) = patrol_assignments.get(&d.id).cloned() {
+                d.patrol_routes = routes.clone();
+                if !routes.is_empty() {
+                    let n = (n_patrol_units as usize).min(d.units.len());
+                    for (i, u) in d.units.iter_mut().enumerate().take(n) {
+                        u.patrol_route = Some(routes[i % routes.len()].clone());
+                    }
+                }
             }
         }
 
-        detect_border_nodes(&mut districts);
         let event_heap = seed_events(&districts, &profiles, &mut seed_rng);
 
         if let Some(parent) = Path::new(db_path).parent() {
@@ -295,6 +312,8 @@ impl City {
             next_flush:    FLUSH_EVERY_MINS,
             profiles,
             sim_type,
+            mutual_aid_max_min: cfg.city.sim.mutual_aid_max_min.unwrap_or(8),
+            mutual_aid_enabled: cfg.city.sim.mutual_aid_enabled.unwrap_or(false),
         }
     }
 
@@ -302,48 +321,62 @@ impl City {
     pub fn from_config(cfg: &LoadedConfig) -> Self {
         Self::from_config_with_db(cfg, "./output/dispatch_sim.db")
     }
-}
 
-// ---------------------------------------------------------------------------
-// H3-adjacency routing fallback (used when no OSM path is configured)
-// ---------------------------------------------------------------------------
+    // ─────────────────────────────────────────────────────────────────────
+    // Mutual-aid pass
+    // ─────────────────────────────────────────────────────────────────────
 
-/// Build a RoutingEngine from H3 cell adjacency with haversine-based travel times.
-/// Each hex is connected to its H3 grid-disk-1 neighbors present in the district.
-/// Assumes an average road speed of 30 km/h.
-fn build_h3_routing_engine(hexes: &[Hex]) -> RoutingEngine {
-    const SPEED_M_PER_MIN: f64 = 30_000.0 / 60.0; // 30 km/h
+    /// For each pending aid request, find a neighbour district with an
+    /// available unit close enough to the requesting incident, and loan it.
+    /// Modifies `follow_on` directly with any dispatch events produced by the
+    /// lender district.
+    fn run_mutual_aid_pass(
+        &mut self,
+        time:      SimTime,
+        requests:  &[MutualAidRequest],
+        follow_on: &mut Vec<(SimEvent, Event, Option<RouteRecord>)>,
+    ) {
+        for req in requests {
+            // Find the requesting district's neighbour set.
+            let req_idx = match self.districts.iter().position(|d| d.id == req.requesting_district) {
+                Some(i) => i,
+                None    => continue,
+            };
+            let neighbour_ids: Vec<DistrictId> = {
+                let mut seen = std::collections::HashSet::new();
+                self.districts[req_idx].border_nodes.iter()
+                    .filter_map(|b| if seen.insert(b.neighbour_district) { Some(b.neighbour_district) } else { None })
+                    .collect()
+            };
+            if neighbour_ids.is_empty() { continue; }
 
-    let mut graph: RoadGraph = RoadGraph::new();
-    let mut nx_by_h3: HashMap<u64, NodeIndex> = HashMap::with_capacity(hexes.len());
-
-    for hex in hexes {
-        let nx = graph.add_node(Node {
-            id:       hex.node_id(),
-            position: geo::Point::new(hex.lon, hex.lat),
-        });
-        nx_by_h3.insert(hex.h3_index, nx);
-    }
-
-    for hex in hexes {
-        if let Ok(cell) = CellIndex::try_from(hex.h3_index) {
-            let from_nx = nx_by_h3[&hex.h3_index];
-            let disk: Vec<CellIndex> = cell.grid_disk::<Vec<_>>(1);
-            for nbr in disk {
-                let nbr_u64 = u64::from(nbr);
-                if nbr_u64 == hex.h3_index { continue; }
-                if let Some(&to_nx) = nx_by_h3.get(&nbr_u64) {
-                    let nc = h3o::LatLng::from(nbr);
-                    let dist_m = haversine_m(hex.lat, hex.lon, nc.lat(), nc.lng());
-                    let time_min = ((dist_m / SPEED_M_PER_MIN) as u32).max(1);
-                    graph.add_edge(from_nx, to_nx, Edge { travel_time_min: time_min });
+            // Pick the closest lender (by travel_time of any free unit).
+            let mut best: Option<(usize, u32)> = None; // (district_index, travel_time)
+            for nbr_id in &neighbour_ids {
+                let Some(idx) = self.districts.iter().position(|d| d.id == *nbr_id) else { continue; };
+                let tt = self.districts[idx].units.iter()
+                    .filter(|u| u.status == UnitStatus::Idle || u.status == UnitStatus::Patrolling)
+                    .map(|u| self.districts[idx].routing.travel_time(u.current_position(time), req.location))
+                    .min();
+                if let Some(t) = tt {
+                    if t > self.mutual_aid_max_min { continue; }
+                    if best.is_none_or(|(_, bt)| t < bt) {
+                        best = Some((idx, t));
+                    }
                 }
+            }
+            let Some((lender_idx, _)) = best else { continue; };
+
+            // Try to dispatch from the lender. If it succeeds, mark the
+            // requester's incident as Assigned so its own pop_best_pending
+            // skips it on subsequent ticks.
+            let success = self.districts[lender_idx]
+                .try_accept_loan(time, req.requesting_district, req, follow_on);
+            if success {
+                self.districts[req_idx].mark_loaned_out(&req.incident_id);
             }
         }
     }
-
-    let anchors: Vec<NodeId> = hexes.iter().map(|h| h.node_id()).collect();
-    RoutingEngine::from_graph(graph, &anchors)
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +448,8 @@ fn detect_border_nodes(districts: &mut [District]) {
     }
 }
 
-/// Seed the initial event heap with ShiftChange and IncidentSpawn events.
+/// Seed the initial event heap with ShiftChange, IncidentSpawn, and (for any
+/// units that have a patrol route assigned) initial PatrolLoop events.
 fn seed_events(
     districts: &[District],
     profiles: &HashMap<SpawnProfileId, SpawnProfile>,
@@ -428,6 +462,10 @@ fn seed_events(
             time:        SimTime(0),
             district_id: district.id,
         }));
+
+        for ev in district.initial_patrol_events() {
+            heap.push(Reverse(ev));
+        }
 
         for hex in &district.hexes {
             let first_time = crate::spawner::next_spawn_time(
@@ -448,62 +486,47 @@ fn seed_events(
 }
 
 // ---------------------------------------------------------------------------
-// Routing cache (binary serialization)
+// Patrol route loading
 // ---------------------------------------------------------------------------
 
-/// In-memory representation of a loaded routing cache.
-struct LoadedRoutingCache {
-    /// district_id → RoutingSnapshot
-    snapshots: HashMap<u32, RoutingSnapshot>,
-    /// district_id → (h3_index → nearest_road_node raw id)
-    hex_nodes: HashMap<u32, HashMap<u64, u32>>,
-}
+/// Load patrol routes from the path configured in `cfg.city.patrol` and pair
+/// them with each district's `patrol_units` count. Returns a map from
+/// `DistrictId` to `(routes, patrol_units)`. Errors are logged and produce
+/// an empty map (no patrols).
+fn load_patrol_assignments(
+    cfg:       &LoadedConfig,
+    districts: &[District],
+) -> HashMap<DistrictId, (Vec<std::sync::Arc<crate::patrol::PatrolRoute>>, u32)> {
+    let mut result: HashMap<DistrictId, (Vec<std::sync::Arc<crate::patrol::PatrolRoute>>, u32)> = HashMap::new();
 
-/// On-disk format for the routing cache file.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RoutingCacheFile {
-    /// (district_id, snapshot, hex_node_assignments)
-    /// hex_node_assignments: Vec<(h3_index, nearest_road_node_raw)>
-    districts: Vec<(u32, RoutingSnapshot, Vec<(u64, u32)>)>,
-}
-
-fn load_routing_cache(path: &str) -> Option<LoadedRoutingCache> {
-    let data = std::fs::read(path).ok()?;
-    let (file, _): (RoutingCacheFile, _) = bincode::serde::decode_from_slice(
-        &data,
-        bincode::config::standard(),
-    ).ok()?;
-
-    println!("Loaded routing cache from: {} ({} districts)", path, file.districts.len());
-
-    let mut snapshots = HashMap::new();
-    let mut hex_nodes = HashMap::new();
-    for (did, snap, nodes) in file.districts {
-        snapshots.insert(did, snap);
-        hex_nodes.insert(did, nodes.into_iter().collect());
-    }
-    Some(LoadedRoutingCache { snapshots, hex_nodes })
-}
-
-fn save_routing_cache(path: &str, districts: &[District]) {
-    let file = RoutingCacheFile {
-        districts: districts.iter().map(|d| {
-            let snap = d.routing.to_snapshot();
-            let hex_nodes: Vec<(u64, u32)> = d.hexes.iter()
-                .filter_map(|h| {
-                    h.nearest_road_node.map(|n| (h.h3_index, n.value()))
-                })
-                .collect();
-            (d.id.value(), snap, hex_nodes)
-        }).collect(),
+    let routes_path = match cfg.city.patrol.as_ref().and_then(|p| p.routes_path.as_ref()) {
+        Some(p) => p,
+        None    => return result, // no patrol config — empty assignments
     };
 
-    let data = bincode::serde::encode_to_vec(&file, bincode::config::standard())
-        .expect("failed to encode routing cache");
+    let routings: HashMap<DistrictId, std::sync::Arc<RoutingEngine>> = districts
+        .iter()
+        .map(|d| (d.id, d.routing.clone()))
+        .collect();
 
-    if let Some(parent) = Path::new(path).parent() {
-        std::fs::create_dir_all(parent).ok();
+    let routes: PatrolRouteSet = match patrol::load_routes(std::path::Path::new(routes_path), &routings) {
+        Ok(r)  => r,
+        Err(e) => {
+            eprintln!("warning: could not load patrol routes from '{}': {}", routes_path, e);
+            return result;
+        }
+    };
+
+    // Per-district patrol_units count, looked up from city.toml.
+    let patrol_unit_counts: HashMap<u32, u32> = cfg.city.districts.iter()
+        .map(|d| (d.id, d.patrol_units.unwrap_or(0)))
+        .collect();
+
+    for (did, district_routes) in routes {
+        let n = patrol_unit_counts.get(&did.value()).copied().unwrap_or(0);
+        result.insert(did, (district_routes, n));
     }
-    std::fs::write(path, data).expect("failed to write routing cache");
-    println!("Saved routing cache to: {} ({} districts)", path, districts.len());
+
+    result
 }
+

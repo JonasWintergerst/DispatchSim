@@ -16,6 +16,8 @@ use serde::Deserialize;
 
 use dispatch_sim::config::SpawnProfileConfig;
 use dispatch_sim::geo_utils::haversine_m;
+use dispatch_sim::routing::{RoadGraph, RoutingEngine};
+use dispatch_sim::routing_cache::{self, DistrictCacheEntry};
 use dispatch_sim::types::NodeId;
 use rayon::prelude::*;
 
@@ -43,6 +45,10 @@ struct OptimizeConfig {
     /// Output path for districts.json (district → selected station mapping).
     /// Defaults to "config/districts.json".
     districts_output_path:   Option<String>,
+    /// Output path for the binary routing cache consumed by the simulator.
+    /// Defaults to "output/routing_cache.bin" to match `city.toml`'s
+    /// `routing_cache_path`.
+    routing_cache_output_path: Option<String>,
     constraints:             ConstraintsConfig,
     objective:               ObjectiveConfig,
     solver:                  SolverConfig,
@@ -352,6 +358,79 @@ fn main() {
             process::exit(1);
         });
     println!("Written {districts_path} ({} entries)", solution.station_indices.len());
+
+    // 11. Build and persist the routing cache for the simulator.
+    //
+    // For each district we build a per-district OSM subgraph (bbox of its
+    // hex centres + 0.02° padding — matches the buffer the sim used to
+    // apply) and anchor Dijkstra on hex nodes + the station node. The sim
+    // loads this snapshot on every run so it never has to touch the OSM PBF.
+    //
+    // Anchor set and bbox padding MUST match what the sim previously built
+    // itself so `travel_time()` lookups hit the precomputed table for every
+    // hex-to-hex and hex-to-station pair the sim will query.
+    let cache_path = cfg.routing_cache_output_path
+        .as_deref()
+        .unwrap_or("output/routing_cache.bin");
+
+    println!("Building routing cache for {} districts…", cfg.n_districts);
+
+    // Group hexes by their assigned district_id.
+    let mut hexes_by_district: HashMap<u32, Vec<&H3Hex>> = HashMap::new();
+    for (i, h) in problem.hexes.iter().enumerate() {
+        let did = solution.assignments[i] as u32;
+        hexes_by_district.entry(did).or_default().push(h);
+    }
+
+    // Build each district's snapshot in parallel.
+    let cache_entries: Vec<DistrictCacheEntry> =
+        (0..cfg.n_districts as u32)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|district_id| {
+                let district_hexes = hexes_by_district
+                    .get(&district_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+
+                if district_hexes.is_empty() {
+                    // Empty district still gets an empty snapshot so the sim's
+                    // per-district lookup succeeds.
+                    let engine = RoutingEngine::from_graph(RoadGraph::new(), &[]);
+                    return (district_id, engine.to_snapshot(), Vec::new());
+                }
+
+                let lat_min = district_hexes.iter().map(|h| h.lat).fold(f64::MAX, f64::min);
+                let lat_max = district_hexes.iter().map(|h| h.lat).fold(f64::MIN, f64::max);
+                let lon_min = district_hexes.iter().map(|h| h.lon).fold(f64::MAX, f64::min);
+                let lon_max = district_hexes.iter().map(|h| h.lon).fold(f64::MIN, f64::max);
+
+                let subgraph = osm.subgraph_for_bbox(lat_min, lat_max, lon_min, lon_max, 0.02);
+
+                // Anchor set = all hex OSM nodes + this district's station node.
+                let station_idx = solution.station_indices[district_id as usize];
+                let station_node = problem.candidate_stations[station_idx].nearest_osm_node;
+
+                let mut anchors: Vec<NodeId> = district_hexes.iter()
+                    .map(|h| NodeId::new(h.nearest_osm_node))
+                    .collect();
+                anchors.push(NodeId::new(station_node));
+                anchors.sort_by_key(|n| n.value());
+                anchors.dedup();
+
+                let engine = RoutingEngine::from_graph(subgraph, &anchors);
+                let snap = engine.to_snapshot();
+
+                // Per-district hex → OSM node map (h3_index → raw node id).
+                let hex_nodes: Vec<(u64, u32)> = district_hexes.iter()
+                    .map(|h| (h.index, h.nearest_osm_node))
+                    .collect();
+
+                (district_id, snap, hex_nodes)
+            })
+            .collect();
+
+    routing_cache::save(cache_path, cache_entries);
 
     println!("Run `cargo run -- config/city.toml` to simulate the optimized layout.");
 }

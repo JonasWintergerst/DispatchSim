@@ -5,22 +5,37 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use rusqlite::Connection;
 
 use crate::city::City;
 use crate::config::LoadedConfig;
+use crate::routing_cache::LoadedRoutingCache;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A single what-if variant: a label plus per-district unit counts.
+/// A single what-if variant: a label plus per-district unit counts and
+/// optional patrol/mutual-aid overrides.
 #[derive(Clone, Debug)]
 pub struct Variant {
     pub name: String,
     /// district_id → unit_count
     pub unit_counts: Vec<(u32, u32)>,
+    /// When `Some`, overrides `cfg.city.patrol.routes_path` for this run.
+    /// e.g. "config/patrol_routes_hotspot.json".
+    pub patrol_routes_path: Option<String>,
+    /// When `Some`, overrides `cfg.city.sim.mutual_aid_enabled`.
+    pub mutual_aid: Option<bool>,
+}
+
+impl Variant {
+    /// Convenience constructor for the legacy unit-reallocation case.
+    pub fn realloc(name: impl Into<String>, unit_counts: Vec<(u32, u32)>) -> Self {
+        Self { name: name.into(), unit_counts, patrol_routes_path: None, mutual_aid: None }
+    }
 }
 
 /// SLA result for one priority level.
@@ -66,36 +81,78 @@ impl VariantResult {
 /// Run a simulation variant with the given unit counts and return SLA results.
 /// `config_path` is the path to city.toml.
 /// `db_path` is the output SQLite path (will be overwritten).
+///
+/// This single-shot entry point reloads the routing cache from disk every call.
+/// When running many variants in a batch, prefer `run_variant_with_cache` to
+/// share one `Arc<LoadedRoutingCache>` across all workers.
 pub fn run_variant(
     config_path: &Path,
     variant: &Variant,
     db_path: &str,
     sim_end: Option<u64>,
 ) -> Result<VariantResult, String> {
-    // Load a fresh config and apply unit count overrides.
+    let cfg = load_variant_config(config_path, variant, sim_end)?;
+    let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
+
+    let mut city = City::from_config_with_db(&cfg, db_path);
+    run_sim(&mut city, cfg.city.sim.duration_minutes);
+
+    extract_sla(db_path, &variant.name, total_units)
+        .map_err(|e| format!("SLA extraction: {e}"))
+}
+
+/// Run a variant using a preloaded routing cache. Used by the parallel
+/// whatif runner — every worker clones the same `Arc` so the routing graph
+/// and anchor travel-time table are built exactly once per batch.
+pub fn run_variant_with_cache(
+    config_path: &Path,
+    variant:     &Variant,
+    db_path:     &str,
+    sim_end:     Option<u64>,
+    cache:       Arc<LoadedRoutingCache>,
+) -> Result<VariantResult, String> {
+    let cfg = load_variant_config(config_path, variant, sim_end)?;
+    let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
+
+    let mut city = City::from_config_with_routing(&cfg, db_path, cache);
+    run_sim(&mut city, cfg.city.sim.duration_minutes);
+
+    extract_sla(db_path, &variant.name, total_units)
+        .map_err(|e| format!("SLA extraction: {e}"))
+}
+
+fn load_variant_config(
+    config_path: &Path,
+    variant: &Variant,
+    sim_end: Option<u64>,
+) -> Result<LoadedConfig, String> {
     let mut cfg = LoadedConfig::load(config_path)
         .map_err(|e| format!("config load: {e}"))?;
 
-    let mut total_units = 0u32;
     for (district_id, unit_count) in &variant.unit_counts {
         if let Some(d) = cfg.city.districts.iter_mut().find(|d| d.id == *district_id) {
             d.unit_count = *unit_count;
         }
-        total_units += unit_count;
     }
 
-    // Optionally shorten the sim for faster iteration.
     if let Some(end) = sim_end {
         cfg.city.sim.duration_minutes = end;
     }
-
-    // Disable route recording for speed.
     cfg.city.sim.record_routes = false;
 
-    // Build and run the simulation.
-    let mut city = City::from_config_with_db(&cfg, db_path);
-    let sim_end_min = cfg.city.sim.duration_minutes;
+    if let Some(routes_path) = &variant.patrol_routes_path {
+        cfg.city.patrol = Some(crate::config::PatrolConfig {
+            routes_path: Some(routes_path.clone()),
+        });
+    }
+    if let Some(enabled) = variant.mutual_aid {
+        cfg.city.sim.mutual_aid_enabled = Some(enabled);
+    }
 
+    Ok(cfg)
+}
+
+fn run_sim(city: &mut City, sim_end_min: u64) {
     loop {
         if city.event_heap.is_empty() || city.clock.elapsed_min >= sim_end_min {
             break;
@@ -103,12 +160,6 @@ pub fn run_variant(
         city.tick();
     }
     city.flush();
-
-    // Extract SLA metrics from the output database.
-    let result = extract_sla(db_path, &variant.name, total_units)
-        .map_err(|e| format!("SLA extraction: {e}"))?;
-
-    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -194,10 +245,7 @@ pub fn generate_reallocation_variants(
 
     // Baseline variant
     let baseline: Vec<(u32, u32)> = base_counts.iter().map(|(id, _, c)| (*id, *c)).collect();
-    variants.push(Variant {
-        name: "Baseline".into(),
-        unit_counts: baseline.clone(),
-    });
+    variants.push(Variant::realloc("Baseline", baseline.clone()));
 
     // For each district pair, try transferring `delta` units in each direction
     let n = base_counts.len();
@@ -208,38 +256,76 @@ pub fn generate_reallocation_variants(
             let (id_i, name_i, count_i) = &base_counts[i];
             let (id_j, name_j, count_j) = &base_counts[j];
 
-            // Transfer delta from i→j (if i has enough)
             if *count_i > delta {
                 let mut v = baseline.clone();
                 for (id, c) in v.iter_mut() {
                     if *id == *id_i { *c -= delta; }
                     if *id == *id_j { *c += delta; }
                 }
-                variants.push(Variant {
-                    name: format!("{name_i} -{delta} → {name_j} +{delta}"),
-                    unit_counts: v,
-                });
+                variants.push(Variant::realloc(
+                    format!("{name_i} -{delta} → {name_j} +{delta}"),
+                    v,
+                ));
             }
 
             if variants.len() >= max_variants { break; }
 
-            // Transfer delta from j→i
             if *count_j > delta {
                 let mut v = baseline.clone();
                 for (id, c) in v.iter_mut() {
                     if *id == *id_j { *c -= delta; }
                     if *id == *id_i { *c += delta; }
                 }
-                variants.push(Variant {
-                    name: format!("{name_j} -{delta} → {name_i} +{delta}"),
-                    unit_counts: v,
-                });
+                variants.push(Variant::realloc(
+                    format!("{name_j} -{delta} → {name_i} +{delta}"),
+                    v,
+                ));
             }
         }
         if variants.len() >= max_variants { break; }
     }
 
     variants
+}
+
+// ---------------------------------------------------------------------------
+// Patrol / mutual-aid variant generation
+// ---------------------------------------------------------------------------
+
+/// Generate variants that exercise the patrol + mutual-aid features. The
+/// baseline is the supplied unit counts with no patrols and aid disabled;
+/// each subsequent variant turns on a single combination so the resulting
+/// table makes the contribution of each feature obvious.
+pub fn generate_patrol_variants(
+    base_counts:        &[(u32, String, u32)],
+    patrol_route_paths: &[(String, String)],   // (label, json path)
+) -> Vec<Variant> {
+    let baseline_counts: Vec<(u32, u32)> =
+        base_counts.iter().map(|(id, _, c)| (*id, *c)).collect();
+
+    let mut out = Vec::new();
+    out.push(Variant::realloc("Baseline (no patrol, no aid)", baseline_counts.clone()));
+    out.push(Variant {
+        name:               "Mutual aid only".to_string(),
+        unit_counts:        baseline_counts.clone(),
+        patrol_routes_path: None,
+        mutual_aid:         Some(true),
+    });
+    for (label, path) in patrol_route_paths {
+        out.push(Variant {
+            name:               format!("Patrol: {label}"),
+            unit_counts:        baseline_counts.clone(),
+            patrol_routes_path: Some(path.clone()),
+            mutual_aid:         Some(false),
+        });
+        out.push(Variant {
+            name:               format!("Patrol: {label} + aid"),
+            unit_counts:        baseline_counts.clone(),
+            patrol_routes_path: Some(path.clone()),
+            mutual_aid:         Some(true),
+        });
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

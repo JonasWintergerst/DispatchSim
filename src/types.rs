@@ -32,6 +32,9 @@ pub enum UnitStatus {
     Dispatched,
     OnScene,
     Returning,
+    /// Cycling through a patrol route. Position is computed lazily from
+    /// `Unit::patrol_started_at` and the route's cumulative segment times.
+    Patrolling,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -132,6 +135,13 @@ impl StationId {
     pub fn value(self) -> u32 { self.0 }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PatrolRouteId(u32);
+impl PatrolRouteId {
+    pub fn new(val: u32) -> Self { Self(val) }
+    pub fn value(self) -> u32 { self.0 }
+}
+
 /// Minimum number of units required to handle an incident.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct UnitRequirements(pub u8);
@@ -142,4 +152,16 @@ pub struct UnitRequirements(pub u8);
 pub struct BorderNode {
     pub node_id:            NodeId,
     pub neighbour_district: DistrictId,
+}
+
+/// A request from one district that has no available local unit. Emitted by
+/// `District::process_events` and consumed by the City-level mutual-aid pass
+/// in `City::tick`.
+#[derive(Clone)]
+pub struct MutualAidRequest {
+    pub requesting_district: DistrictId,
+    pub incident_id:         IncidentId,
+    pub location:            NodeId,
+    pub priority:            Priority,
+    pub spawn_time:          crate::clock::SimTime,
 }

@@ -32,6 +32,11 @@ fn main() {
         return;
     }
 
+    if args.get(1).map(String::as_str) == Some("whatif-patrol") {
+        run_whatif_patrol(&args);
+        return;
+    }
+
     let config_path = resolve_config_path();
 
     println!("Loading config from: {}", config_path.display());
@@ -105,7 +110,9 @@ fn run(mut city: City, cfg: &LoadedConfig) {
 // ---------------------------------------------------------------------------
 
 fn run_whatif(args: &[String]) {
-    use dispatch_sim::whatif::{generate_reallocation_variants, run_variant, print_comparison_table};
+    use std::sync::Arc;
+    use rayon::prelude::*;
+    use dispatch_sim::whatif::{generate_reallocation_variants, run_variant_with_cache, print_comparison_table};
 
     let config_path = args.get(2).map(String::as_str).unwrap_or("config/city.toml");
     let max_variants: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -134,29 +141,200 @@ fn run_whatif(args: &[String]) {
         println!("  Sim duration: {d} min (shortened)");
     }
 
+    // Load the routing cache once and share it across all parallel workers.
+    // Every variant deserialises its own `RoutingEngine` from the snapshots,
+    // but the bincode decode of the cache file itself happens exactly once.
+    let cache_path = cfg.city.sim.routing_cache_path.as_deref().unwrap_or_else(|| {
+        eprintln!("error: sim.routing_cache_path is not set in {config_path}");
+        process::exit(1);
+    });
+    let cache = Arc::new(
+        dispatch_sim::routing_cache::load(cache_path).unwrap_or_else(|| {
+            eprintln!("error: routing cache not found at {cache_path} — run `cargo run --bin optimize` first");
+            process::exit(1);
+        }),
+    );
+
     let variants = generate_reallocation_variants(&base_counts, delta, max_variants);
-    println!("\nGenerated {} variants. Running simulations…\n", variants.len());
+    let n_variants = variants.len();
+    println!("\nGenerated {n_variants} variants. Running simulations in parallel…\n");
 
     let config_p = Path::new(config_path);
-    let mut results = Vec::new();
+    let batch_start = Instant::now();
 
-    for (i, variant) in variants.iter().enumerate() {
-        let db_path = format!("./output/whatif_{i}.db");
-        print!("  [{}/{}] {:<40} … ", i + 1, variants.len(), variant.name);
-
-        let now = Instant::now();
-        match run_variant(config_p, variant, &db_path, sim_duration) {
-            Ok(r) => {
-                let elapsed = now.elapsed().as_secs();
-                println!("done ({elapsed}s) — SLA overall: {:.1}%", r.overall_sla_pct());
-                results.push(r);
+    // Parallelise across variants. Each worker owns its own `City` and its own
+    // SQLite DB (per-variant path), so there is no shared mutable state beyond
+    // the read-only `Arc<LoadedRoutingCache>`. Determinism is preserved because
+    // every variant re-seeds from `cfg.city.sim.rng_seed`, which is constant.
+    let mut indexed: Vec<(usize, Result<dispatch_sim::whatif::VariantResult, String>)> = variants
+        .par_iter()
+        .enumerate()
+        .map(|(i, variant)| {
+            let db_path = format!("./output/whatif_{i}.db");
+            let now = Instant::now();
+            let res = run_variant_with_cache(
+                config_p,
+                variant,
+                &db_path,
+                sim_duration,
+                Arc::clone(&cache),
+            );
+            match &res {
+                Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
+                                   i + 1, variant.name, now.elapsed().as_secs(), r.overall_sla_pct()),
+                Err(e) => println!("  [{:>3}/{n_variants}] {:<40} FAILED: {e}",
+                                   i + 1, variant.name),
             }
-            Err(e) => {
-                println!("FAILED: {e}");
+            (i, res)
+        })
+        .collect();
+
+    // Sort by variant index so output order is deterministic regardless of
+    // the order rayon happened to complete them in.
+    indexed.sort_by_key(|(i, _)| *i);
+    let mut results: Vec<_> = indexed.into_iter().filter_map(|(_, r)| r.ok()).collect();
+
+    println!("\nBatch complete in {}s.", batch_start.elapsed().as_secs());
+    print_comparison_table(&mut results);
+}
+
+// ---------------------------------------------------------------------------
+// What-if patrol strategy comparison
+// ---------------------------------------------------------------------------
+
+fn run_whatif_patrol(args: &[String]) {
+    use std::sync::Arc;
+    use rayon::prelude::*;
+    use dispatch_sim::whatif::{generate_patrol_variants, run_variant_with_cache, print_comparison_table};
+
+    let config_path = args.get(2).map(String::as_str).unwrap_or("config/city.toml");
+
+    // Parse remaining args: --strategy <label> (repeatable), --no-aid, [duration_min]
+    let mut strategy_filter: Vec<String> = Vec::new();
+    let mut include_aid = true;
+    let mut sim_duration: Option<u64> = None;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--strategy" => {
+                if let Some(label) = args.get(i + 1) {
+                    strategy_filter.push(label.clone());
+                    i += 2;
+                } else {
+                    eprintln!("error: --strategy requires a label");
+                    process::exit(1);
+                }
+            }
+            "--no-aid" => { include_aid = false; i += 1; }
+            other => {
+                if let Ok(dur) = other.parse::<u64>() {
+                    sim_duration = Some(dur);
+                }
+                i += 1;
             }
         }
     }
 
+    let cfg = dispatch_sim::config::LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        process::exit(1);
+    });
+
+    let base_counts: Vec<(u32, String, u32)> = cfg.city.districts
+        .iter()
+        .map(|d| (d.id, d.name.clone(), d.unit_count))
+        .collect();
+
+    // Discover patrol_routes_*.json under config/
+    let mut all_routes: Vec<(String, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("config") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if let Some(label) = stem.strip_prefix("patrol_routes_") {
+                all_routes.push((label.to_string(), path.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    all_routes.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let route_paths: Vec<(String, String)> = if strategy_filter.is_empty() {
+        all_routes
+    } else {
+        all_routes.into_iter()
+            .filter(|(label, _)| strategy_filter.iter().any(|s| s == label))
+            .collect()
+    };
+
+    if route_paths.is_empty() {
+        eprintln!("error: no patrol_routes_*.json files found in config/ (or none matched the --strategy filter)");
+        eprintln!("hint: run `cargo run --bin patrol_gen -- {config_path} hotspot` first");
+        process::exit(1);
+    }
+
+    println!("What-If Patrol Strategy Comparison");
+    println!("  Config:    {config_path}");
+    println!("  Districts: {}", base_counts.len());
+    println!("  Strategies: {}", route_paths.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "));
+    println!("  Mutual aid variants: {}", if include_aid { "yes" } else { "no" });
+    if let Some(d) = sim_duration {
+        println!("  Sim duration: {d} min (shortened)");
+    }
+
+    let cache_path = cfg.city.sim.routing_cache_path.as_deref().unwrap_or_else(|| {
+        eprintln!("error: sim.routing_cache_path is not set in {config_path}");
+        process::exit(1);
+    });
+    let cache = Arc::new(
+        dispatch_sim::routing_cache::load(cache_path).unwrap_or_else(|| {
+            eprintln!("error: routing cache not found at {cache_path} — run `cargo run --bin optimize` first");
+            process::exit(1);
+        }),
+    );
+
+    let mut variants = generate_patrol_variants(&base_counts, &route_paths);
+    if !include_aid {
+        variants.retain(|v| {
+            v.name != "Mutual aid only" && !v.name.ends_with(" + aid")
+        });
+    }
+    let n_variants = variants.len();
+    println!("\nGenerated {n_variants} variants. Running simulations in parallel…\n");
+
+    let config_p = Path::new(config_path);
+    let batch_start = Instant::now();
+
+    let mut indexed: Vec<(usize, Result<dispatch_sim::whatif::VariantResult, String>)> = variants
+        .par_iter()
+        .enumerate()
+        .map(|(i, variant)| {
+            let db_path = format!("./output/whatif_patrol_{i}.db");
+            let now = Instant::now();
+            let res = run_variant_with_cache(
+                config_p,
+                variant,
+                &db_path,
+                sim_duration,
+                Arc::clone(&cache),
+            );
+            match &res {
+                Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
+                                   i + 1, variant.name, now.elapsed().as_secs(), r.overall_sla_pct()),
+                Err(e) => println!("  [{:>3}/{n_variants}] {:<40} FAILED: {e}",
+                                   i + 1, variant.name),
+            }
+            (i, res)
+        })
+        .collect();
+
+    indexed.sort_by_key(|(i, _)| *i);
+    let mut results: Vec<_> = indexed.into_iter().filter_map(|(_, r)| r.ok()).collect();
+
+    println!("\nBatch complete in {}s.", batch_start.elapsed().as_secs());
     print_comparison_table(&mut results);
 }
 

@@ -110,8 +110,9 @@ Measured on AMD Ryzen 5 2600 (6 cores, 3.4 GHz), 16 GB RAM, Windows 11 — relea
 
 | Phase | Time |
 |-------|------|
-| Setup (OSM load + Dijkstra) | **16 s** |
-| 4-year simulation (~1.9 M events) | **~3 min** |
+| Optimizer (OSM load, p-median, adjacency, repair) | **14.2 s** |
+| Simulator setup (routing cache load) | **0.8 s** |
+| 4-year simulation (~1.63 M events) | **93.8 s** (~17.4 k events/s) |
 | Peak memory | **~220 MB** |
 
 ```bash
