@@ -63,124 +63,148 @@ lon_max = 10.330
 # ---------------------------------------------------------------------------
 
 [[districts]]
-id         = 0
-name       = "PK 11"
-unit_count = 7
+id           = 0
+name         = "PK 11"
+unit_count   = 7
+patrol_units = 2
 
 [[districts]]
-id         = 1
-name       = "PK 12"
-unit_count = 4
+id           = 1
+name         = "PK 12"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 2
-name       = "PK 13"
-unit_count = 3
+id           = 2
+name         = "PK 13"
+unit_count   = 3
+patrol_units = 1
 
 [[districts]]
-id         = 3
-name       = "PK 14"
-unit_count = 25
+id           = 3
+name         = "PK 14"
+unit_count   = 25
+patrol_units = 8
 
 [[districts]]
-id         = 4
-name       = "PK 15"
-unit_count = 12
+id           = 4
+name         = "PK 15"
+unit_count   = 12
+patrol_units = 4
 
 [[districts]]
-id         = 5
-name       = "PK 16"
-unit_count = 11
+id           = 5
+name         = "PK 16"
+unit_count   = 11
+patrol_units = 3
 
 [[districts]]
-id         = 6
-name       = "PK 17"
-unit_count = 3
+id           = 6
+name         = "PK 17"
+unit_count   = 3
+patrol_units = 1
 
 [[districts]]
-id         = 7
-name       = "PK 21"
-unit_count = 4
+id           = 7
+name         = "PK 21"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 8
-name       = "PK 22"
-unit_count = 8
+id           = 8
+name         = "PK 22"
+unit_count   = 8
+patrol_units = 2
 
 [[districts]]
-id         = 9
-name       = "PK 23"
-unit_count = 8
+id           = 9
+name         = "PK 23"
+unit_count   = 8
+patrol_units = 2
 
 [[districts]]
-id         = 10
-name       = "PK 24"
-unit_count = 4
+id           = 10
+name         = "PK 24"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 11
-name       = "PK 25"
-unit_count = 8
+id           = 11
+name         = "PK 25"
+unit_count   = 8
+patrol_units = 2
 
 [[districts]]
-id         = 12
-name       = "PK 26"
-unit_count = 4
+id           = 12
+name         = "PK 26"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 13
-name       = "PK 27"
-unit_count = 4
+id           = 13
+name         = "PK 27"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 14
-name       = "PK 31"
-unit_count = 6
+id           = 14
+name         = "PK 31"
+unit_count   = 6
+patrol_units = 2
 
 [[districts]]
-id         = 15
-name       = "PK 32"
-unit_count = 6
+id           = 15
+name         = "PK 32"
+unit_count   = 6
+patrol_units = 2
 
 [[districts]]
-id         = 16
-name       = "PK 33"
-unit_count = 3
+id           = 16
+name         = "PK 33"
+unit_count   = 3
+patrol_units = 1
 
 [[districts]]
-id         = 17
-name       = "PK 34"
-unit_count = 2
+id           = 17
+name         = "PK 34"
+unit_count   = 2
+patrol_units = 0
 
 [[districts]]
-id         = 18
-name       = "PK 35"
-unit_count = 2
+id           = 18
+name         = "PK 35"
+unit_count   = 2
+patrol_units = 0
 
 [[districts]]
-id         = 19
-name       = "PK 36"
-unit_count = 3
+id           = 19
+name         = "PK 36"
+unit_count   = 3
+patrol_units = 1
 
 [[districts]]
-id         = 20
-name       = "PK 41"
-unit_count = 4
+id           = 20
+name         = "PK 41"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 21
-name       = "PK 42"
-unit_count = 4
+id           = 21
+name         = "PK 42"
+unit_count   = 4
+patrol_units = 1
 
 [[districts]]
-id         = 22
-name       = "PK 43"
-unit_count = 3
+id           = 22
+name         = "PK 43"
+unit_count   = 3
+patrol_units = 1
 
 [[districts]]
-id         = 23
-name       = "PK 46"
-unit_count = 2
+id           = 23
+name         = "PK 46"
+unit_count   = 2
+patrol_units = 0
 
 # ---------------------------------------------------------------------------
 # Spawn profiles

@@ -95,7 +95,7 @@ pub fn run_variant(
     let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
 
     let mut city = City::from_config_with_db(&cfg, db_path);
-    run_sim(&mut city, cfg.city.sim.duration_minutes);
+    run_sim(&mut city, cfg.city.sim.duration_minutes, None);
 
     extract_sla(db_path, &variant.name, total_units)
         .map_err(|e| format!("SLA extraction: {e}"))
@@ -104,18 +104,24 @@ pub fn run_variant(
 /// Run a variant using a preloaded routing cache. Used by the parallel
 /// whatif runner — every worker clones the same `Arc` so the routing graph
 /// and anchor travel-time table are built exactly once per batch.
+///
+/// If `progress` is `Some`, the closure is invoked periodically during the
+/// sim loop with `(elapsed_min, sim_end_min)`. The whatif runner uses this
+/// to print per-variant progress lines analogous to the standard sim's
+/// every-10k-events log line.
 pub fn run_variant_with_cache(
     config_path: &Path,
     variant:     &Variant,
     db_path:     &str,
     sim_end:     Option<u64>,
     cache:       Arc<LoadedRoutingCache>,
+    progress:    Option<&(dyn Fn(u64, u64) + Sync)>,
 ) -> Result<VariantResult, String> {
     let cfg = load_variant_config(config_path, variant, sim_end)?;
     let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
 
     let mut city = City::from_config_with_routing(&cfg, db_path, cache);
-    run_sim(&mut city, cfg.city.sim.duration_minutes);
+    run_sim(&mut city, cfg.city.sim.duration_minutes, progress);
 
     extract_sla(db_path, &variant.name, total_units)
         .map_err(|e| format!("SLA extraction: {e}"))
@@ -152,12 +158,31 @@ fn load_variant_config(
     Ok(cfg)
 }
 
-fn run_sim(city: &mut City, sim_end_min: u64) {
+fn run_sim(
+    city: &mut City,
+    sim_end_min: u64,
+    progress: Option<&(dyn Fn(u64, u64) + Sync)>,
+) {
+    // Mirror the standard sim's progress cadence: a callback every ~10k ticks.
+    // 10k events is a good interval — frequent enough to feel live, infrequent
+    // enough that the println cost is negligible relative to the work.
+    const PROGRESS_EVERY: u64 = 10_000;
+    let mut tick: u64 = 0;
     loop {
         if city.event_heap.is_empty() || city.clock.elapsed_min >= sim_end_min {
             break;
         }
         city.tick();
+        tick += 1;
+        if let Some(cb) = progress {
+            if tick % PROGRESS_EVERY == 0 {
+                cb(city.clock.elapsed_min, sim_end_min);
+            }
+        }
+    }
+    if let Some(cb) = progress {
+        // Final 100% tick so the consumer always sees a terminal update.
+        cb(sim_end_min.min(city.clock.elapsed_min), sim_end_min);
     }
     city.flush();
 }

@@ -7,7 +7,6 @@ use h3o::CellIndex;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::RngExt;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use crate::clock::{SimClock, SimTime};
 use crate::config::{LoadedConfig, SpawnProfileConfig};
@@ -204,11 +203,14 @@ impl City {
         // happened in the optimizer; this loop just restores snapshots.
         let station_lookup = cfg.district_stations.by_district_id();
 
+        // Sequential build: this is one-shot deserialization (the expensive
+        // Dijkstra work already happened in the optimizer), and the outer
+        // whatif runners parallelise across whole sims — nesting rayon here
+        // would just add scheduler contention. See CLAUDE.md "Key Design
+        // Decisions": sims are the unit of parallelism.
         let mut districts: Vec<District> = cfg.city.districts
             .iter()
             .zip(setups.iter())
-            .collect::<Vec<_>>()
-            .into_par_iter()
             .map(|(district_cfg, setup)| {
                 let district_id      = DistrictId::new(district_cfg.id);
                 let mut hex_cursor   = setup.hex_id_start;

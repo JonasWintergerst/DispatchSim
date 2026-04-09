@@ -172,12 +172,18 @@ fn run_whatif(args: &[String]) {
         .map(|(i, variant)| {
             let db_path = format!("./output/whatif_{i}.db");
             let now = Instant::now();
+            let label = variant.name.clone();
+            let progress = move |elapsed: u64, sim_end: u64| {
+                let pct = if sim_end == 0 { 0.0 } else { (elapsed as f64 / sim_end as f64) * 100.0 };
+                println!("  [{:>3}/{n_variants}] {:<40} sim {:>5.1}%", i + 1, label, pct);
+            };
             let res = run_variant_with_cache(
                 config_p,
                 variant,
                 &db_path,
                 sim_duration,
                 Arc::clone(&cache),
+                Some(&progress),
             );
             match &res {
                 Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
@@ -314,12 +320,18 @@ fn run_whatif_patrol(args: &[String]) {
         .map(|(i, variant)| {
             let db_path = format!("./output/whatif_patrol_{i}.db");
             let now = Instant::now();
+            let label = variant.name.clone();
+            let progress = move |elapsed: u64, sim_end: u64| {
+                let pct = if sim_end == 0 { 0.0 } else { (elapsed as f64 / sim_end as f64) * 100.0 };
+                println!("  [{:>3}/{n_variants}] {:<40} sim {:>5.1}%", i + 1, label, pct);
+            };
             let res = run_variant_with_cache(
                 config_p,
                 variant,
                 &db_path,
                 sim_duration,
                 Arc::clone(&cache),
+                Some(&progress),
             );
             match &res {
                 Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
