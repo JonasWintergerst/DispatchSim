@@ -16,6 +16,7 @@ use crate::types::SimType;
 // ---------------------------------------------------------------------------
 
 /// Everything the sim needs before the first tick.
+#[derive(Clone)]
 pub struct LoadedConfig {
     pub city:              CityConfig,
     pub hex_grid:          HexGridConfig,
@@ -41,7 +42,7 @@ impl LoadedConfig {
 // city.toml structs
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CityConfig {
     pub sim: SimConfig,
 
@@ -78,7 +79,7 @@ impl CityConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SimConfig {
     pub tick_minutes: u32,
     pub duration_minutes: u64,
@@ -108,7 +109,7 @@ pub struct SimConfig {
     pub mutual_aid_max_min: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DistrictConfig {
     pub id:         u32,
     pub name:       String,
@@ -119,7 +120,7 @@ pub struct DistrictConfig {
     pub patrol_units: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct SpawnProfileConfig {
     pub base_lambda: f64,
     pub hour_multiplier: [f64; 24],
@@ -128,7 +129,7 @@ pub struct SpawnProfileConfig {
     pub incident_weights: Vec<IncidentWeightConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct IncidentWeightConfig {
     pub kind: String,
     pub weight: f64,
@@ -139,6 +140,7 @@ pub struct IncidentWeightConfig {
 // ---------------------------------------------------------------------------
 
 /// The full hex grid as loaded from hexes.json.
+#[derive(Clone)]
 pub struct HexGridConfig {
     pub hexes: Vec<HexConfig>,
 }
@@ -154,7 +156,7 @@ impl HexGridConfig {
 }
 
 /// One entry in hexes.json, produced by the optimizer.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct HexConfig {
     /// Raw H3 cell index encoded as a u64 integer.
     pub h3_index: u64,
@@ -173,7 +175,7 @@ pub struct HexConfig {
 // ---------------------------------------------------------------------------
 
 /// One entry in districts.json: the station selected for a district.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct DistrictStation {
     pub district_id:      u32,
     pub station_name:     String,
@@ -183,6 +185,7 @@ pub struct DistrictStation {
 }
 
 /// The full district-to-station mapping as loaded from districts.json.
+#[derive(Clone)]
 pub struct DistrictStationGrid {
     pub entries: Vec<DistrictStation>,
 }

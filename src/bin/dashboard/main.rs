@@ -33,6 +33,10 @@ struct DashboardApp {
     live_output: String,
     sim_progress: f32,
     process: Option<RunningProcess>,
+    /// Set when the user clicks Stop. After the process exits, the poll loop
+    /// uses this to switch the status to "Stopped." and to auto-run the report
+    /// against whatever the simulator already flushed to the SQLite DB.
+    stop_requested: bool,
     report_text: Option<String>,
 
     // ── Isochrone overlay ─────────────────────────────────────────────────
@@ -92,6 +96,7 @@ impl DashboardApp {
             live_output: String::new(),
             sim_progress: 0.0,
             process: None,
+            stop_requested: false,
             report_text: None,
             isochrone_minutes,
             show_isochrones: false,
@@ -154,15 +159,58 @@ impl DashboardApp {
 
         if let Some(ok) = finished {
             let was_patrol_gen = self.status.starts_with("Generating patrol routes");
+            let was_whatif = self.whatif_running;
+            let was_stopped = self.stop_requested;
             if self.whatif_running { self.finalize_whatif(); }
-            self.status = if ok { "Done.".into() } else { "Process failed.".into() };
+            self.status = if was_stopped {
+                "Stopped.".into()
+            } else if ok {
+                "Done.".into()
+            } else {
+                "Process failed.".into()
+            };
             self.live_output.clear();
             self.sim_progress = 0.0;
             self.process = None;
+            self.stop_requested = false;
             if was_patrol_gen && ok {
                 self.whatif_patrol_strategies = scan_patrol_strategies();
             }
+            // After a stopped standard sim, surface whatever the simulator
+            // committed to the SQLite DB so the user can see partial results.
+            // Whatif batches write per-variant DBs and aggregate via stdout,
+            // so the report path doesn't apply there.
+            if was_stopped && !was_whatif {
+                self.run_report();
+                self.status = "Stopped — partial report ready.".into();
+            }
         }
+    }
+
+    /// Kill the running child process tree. The next `poll_process` call will
+    /// observe the exit and (for the standard sim) auto-generate a report from
+    /// whatever the simulator already flushed to disk.
+    fn stop_process(&mut self) {
+        let Some(proc) = &mut self.process else { return };
+        let pid = proc.child.id();
+        #[cfg(windows)]
+        {
+            // `cargo run` spawns the sim binary as a grandchild; killing only
+            // the direct child leaves the simulator orphaned. `taskkill /T`
+            // walks the process tree.
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pid; // silence unused-var on non-windows
+            let _ = proc.child.kill();
+        }
+        self.stop_requested = true;
+        self.status = "Stopping…".into();
     }
 
     fn spawn_optimize(&mut self) {
@@ -249,6 +297,9 @@ impl eframe::App for DashboardApp {
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui.button("⚙ Optimize").clicked() { self.spawn_optimize(); }
                     if ui.button("▶ Simulate").clicked() { self.spawn_simulate(); }
+                });
+                ui.add_enabled_ui(busy && !self.stop_requested, |ui| {
+                    if ui.button("■ Stop").clicked() { self.stop_process(); }
                 });
                 if ui.button("📋 Report").clicked() { self.run_report(); }
 

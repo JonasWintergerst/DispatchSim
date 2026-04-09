@@ -142,24 +142,38 @@ impl City {
             );
         }));
 
-        Self::build_from_cache(cfg, db_path, cached)
+        let engines = Arc::new(build_routing_engines(&cached));
+        Self::build_from_cache(cfg, db_path, cached, engines)
     }
 
-    /// Build a City using an already-loaded routing cache. This is the shared
-    /// path for both `from_config_with_db` (single sim) and `run_whatif`
-    /// (many parallel sims sharing one Arc<LoadedRoutingCache>).
+    /// Build a City using an already-loaded routing cache. Single-sim path
+    /// for callers that already loaded the cache themselves.
     pub fn from_config_with_routing(
         cfg:    &LoadedConfig,
         db_path: &str,
         cached:  Arc<LoadedRoutingCache>,
     ) -> Self {
-        Self::build_from_cache(cfg, db_path, cached)
+        let engines = Arc::new(build_routing_engines(&cached));
+        Self::build_from_cache(cfg, db_path, cached, engines)
+    }
+
+    /// Canonical builder used by `SimBatch`. Takes pre-built per-district
+    /// `RoutingEngine`s so that batches of variants can share them across
+    /// runs and skip the expensive `from_snapshot` work.
+    pub fn from_config_with_engines(
+        cfg:     &LoadedConfig,
+        db_path: &str,
+        cached:  Arc<LoadedRoutingCache>,
+        engines: Arc<HashMap<u32, Arc<RoutingEngine>>>,
+    ) -> Self {
+        Self::build_from_cache(cfg, db_path, cached, engines)
     }
 
     fn build_from_cache(
-        cfg:    &LoadedConfig,
+        cfg:     &LoadedConfig,
         db_path: &str,
         cached:  Arc<LoadedRoutingCache>,
+        engines: Arc<HashMap<u32, Arc<RoutingEngine>>>,
     ) -> Self {
         let sim_type = cfg.city.sim.sim_type;
 
@@ -247,9 +261,9 @@ impl City {
                     }
                 }
 
-                let snap = cached.snapshots.get(&district_cfg.id)
-                    .expect("routing cache missing district — rerun the optimizer");
-                let routing = Arc::new(RoutingEngine::from_snapshot(snap.clone()));
+                let routing = engines.get(&district_cfg.id)
+                    .cloned()
+                    .expect("routing engines missing district — rerun the optimizer");
 
                 // Station location from districts.json (real OSM-snapped station node).
                 let district_station = station_lookup
@@ -485,6 +499,24 @@ fn seed_events(
     }
 
     heap
+}
+
+// ---------------------------------------------------------------------------
+// Routing engine pre-build
+// ---------------------------------------------------------------------------
+
+/// Build per-district `RoutingEngine`s from a loaded routing cache. The
+/// resulting map is intended to be wrapped in an `Arc` and shared across
+/// every variant in a `SimBatch`, so the expensive `from_snapshot`
+/// rehydration runs exactly once per batch instead of once per variant.
+pub fn build_routing_engines(
+    cached: &LoadedRoutingCache,
+) -> HashMap<u32, Arc<RoutingEngine>> {
+    cached.snapshots.iter()
+        .map(|(district_id, snap)| {
+            (*district_id, Arc::new(RoutingEngine::from_snapshot(snap.clone())))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

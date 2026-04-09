@@ -1,29 +1,38 @@
 // whatif.rs
-// What-if unit reallocation: run N sim variants with different unit_count
-// assignments across districts, collect SLA compliance per variant, and
-// output a ranked comparison table.
+// What-if simulation framework: a `SimBatch` owns shared blueprint state
+// (routing cache, pre-built per-district routing engines, base config) and
+// runs a `Vec<Variant>` through one common event loop. The standard sim is
+// just a `SimBatch` with a single identity variant; the whatif unit
+// reallocation and patrol-strategy comparisons are SimBatches with many
+// variants. There is exactly one event loop in the codebase, so progress
+// reporting, mutual-aid handling, and shared-engine reuse all live in one
+// place.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
+use rayon::prelude::*;
 use rusqlite::Connection;
 
-use crate::city::City;
+use crate::city::{self, City};
 use crate::config::LoadedConfig;
-use crate::routing_cache::LoadedRoutingCache;
+use crate::routing::RoutingEngine;
+use crate::routing_cache::{self, LoadedRoutingCache};
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// A single what-if variant: a label plus per-district unit counts and
-/// optional patrol/mutual-aid overrides.
+/// A single what-if variant: a label plus optional per-district unit counts
+/// and optional patrol/mutual-aid overrides. `None` for any field means
+/// "use the value from the base `LoadedConfig` as-is".
 #[derive(Clone, Debug)]
 pub struct Variant {
     pub name: String,
-    /// district_id → unit_count
-    pub unit_counts: Vec<(u32, u32)>,
+    /// When `Some`, overrides per-district `unit_count`. `None` leaves the
+    /// counts from `cfg` untouched (used by the standard-sim batch of one).
+    pub unit_counts: Option<Vec<(u32, u32)>>,
     /// When `Some`, overrides `cfg.city.patrol.routes_path` for this run.
     /// e.g. "config/patrol_routes_hotspot.json".
     pub patrol_routes_path: Option<String>,
@@ -32,9 +41,25 @@ pub struct Variant {
 }
 
 impl Variant {
-    /// Convenience constructor for the legacy unit-reallocation case.
+    /// Identity variant — no overrides, runs `cfg` exactly as loaded.
+    /// This is what the standard sim uses when wrapped in a `SimBatch`.
+    pub fn identity(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            unit_counts: None,
+            patrol_routes_path: None,
+            mutual_aid: None,
+        }
+    }
+
+    /// Convenience constructor for the unit-reallocation case.
     pub fn realloc(name: impl Into<String>, unit_counts: Vec<(u32, u32)>) -> Self {
-        Self { name: name.into(), unit_counts, patrol_routes_path: None, mutual_aid: None }
+        Self {
+            name: name.into(),
+            unit_counts: Some(unit_counts),
+            patrol_routes_path: None,
+            mutual_aid: None,
+        }
     }
 }
 
@@ -75,97 +100,197 @@ impl VariantResult {
 }
 
 // ---------------------------------------------------------------------------
-// Run a single variant
+// SimBatch — the canonical sim runner
 // ---------------------------------------------------------------------------
 
-/// Run a simulation variant with the given unit counts and return SLA results.
-/// `config_path` is the path to city.toml.
-/// `db_path` is the output SQLite path (will be overwritten).
+/// A batch of one or more sim variants that share immutable blueprint state.
+/// The standard sim is a SimBatch with a single `Variant::identity` entry;
+/// the whatif runners build SimBatches with many variants.
 ///
-/// This single-shot entry point reloads the routing cache from disk every call.
-/// When running many variants in a batch, prefer `run_variant_with_cache` to
-/// share one `Arc<LoadedRoutingCache>` across all workers.
-pub fn run_variant(
-    config_path: &Path,
-    variant: &Variant,
-    db_path: &str,
-    sim_end: Option<u64>,
-) -> Result<VariantResult, String> {
-    let cfg = load_variant_config(config_path, variant, sim_end)?;
-    let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
-
-    let mut city = City::from_config_with_db(&cfg, db_path);
-    run_sim(&mut city, cfg.city.sim.duration_minutes, None);
-
-    extract_sla(db_path, &variant.name, total_units)
-        .map_err(|e| format!("SLA extraction: {e}"))
+/// All shared work (loading the routing cache, building per-district
+/// `RoutingEngine`s) happens once during construction. Each variant in the
+/// batch then constructs its own `City` inside a rayon worker, runs the
+/// event loop, drains its SLA results, and drops the city.
+pub struct SimBatch {
+    cfg:                   LoadedConfig,
+    cache:                 Arc<LoadedRoutingCache>,
+    engines:               Arc<HashMap<u32, Arc<RoutingEngine>>>,
+    variants:              Vec<Variant>,
+    /// Output SQLite path. Use `{}` as a placeholder for the variant index.
+    /// Single-variant batches may omit it.
+    db_pattern:            String,
+    /// Optional override for `cfg.city.sim.duration_minutes`.
+    sim_duration_override: Option<u64>,
+    /// Optional override for `cfg.city.sim.record_routes`. The standard sim
+    /// honours the cfg value (None); whatif batches force false to avoid
+    /// per-variant route logging overhead.
+    record_routes_override: Option<bool>,
 }
 
-/// Run a variant using a preloaded routing cache. Used by the parallel
-/// whatif runner — every worker clones the same `Arc` so the routing graph
-/// and anchor travel-time table are built exactly once per batch.
-///
-/// If `progress` is `Some`, the closure is invoked periodically during the
-/// sim loop with `(elapsed_min, sim_end_min)`. The whatif runner uses this
-/// to print per-variant progress lines analogous to the standard sim's
-/// every-10k-events log line.
-pub fn run_variant_with_cache(
-    config_path: &Path,
-    variant:     &Variant,
-    db_path:     &str,
-    sim_end:     Option<u64>,
-    cache:       Arc<LoadedRoutingCache>,
-    progress:    Option<&(dyn Fn(u64, u64) + Sync)>,
-) -> Result<VariantResult, String> {
-    let cfg = load_variant_config(config_path, variant, sim_end)?;
-    let total_units = variant.unit_counts.iter().map(|(_, c)| c).sum::<u32>();
+impl SimBatch {
+    /// Build a SimBatch from a loaded config. Loads the routing cache and
+    /// pre-builds per-district `RoutingEngine`s — both shared across every
+    /// variant in this batch via `Arc`.
+    ///
+    /// The batch starts with a single `Variant::identity("Default")` and the
+    /// standard `./output/dispatch_sim.db` output path; call `with_variants`
+    /// and `with_db_pattern` to customise.
+    pub fn from_config(cfg: LoadedConfig) -> Result<Self, String> {
+        let cache_path = cfg.city.sim.routing_cache_path.as_deref().ok_or_else(|| {
+            "sim.routing_cache_path is not set in city.toml — add e.g. \
+             `routing_cache_path = \"output/routing_cache.bin\"` and run \
+             `cargo run --bin optimize` to produce it".to_string()
+        })?;
+        let cache = Arc::new(routing_cache::load(cache_path).ok_or_else(|| {
+            format!("routing cache not found at {cache_path} — run `cargo run --bin optimize` first")
+        })?);
+        let engines = Arc::new(city::build_routing_engines(&cache));
 
-    let mut city = City::from_config_with_routing(&cfg, db_path, cache);
-    run_sim(&mut city, cfg.city.sim.duration_minutes, progress);
+        Ok(Self {
+            cfg,
+            cache,
+            engines,
+            variants:               vec![Variant::identity("Default")],
+            db_pattern:             "./output/dispatch_sim.db".to_string(),
+            sim_duration_override:  None,
+            record_routes_override: None,
+        })
+    }
 
-    extract_sla(db_path, &variant.name, total_units)
-        .map_err(|e| format!("SLA extraction: {e}"))
-}
+    pub fn with_variants(mut self, variants: Vec<Variant>) -> Self {
+        self.variants = variants;
+        self
+    }
 
-fn load_variant_config(
-    config_path: &Path,
-    variant: &Variant,
-    sim_end: Option<u64>,
-) -> Result<LoadedConfig, String> {
-    let mut cfg = LoadedConfig::load(config_path)
-        .map_err(|e| format!("config load: {e}"))?;
+    pub fn with_db_pattern(mut self, pat: impl Into<String>) -> Self {
+        self.db_pattern = pat.into();
+        self
+    }
 
-    for (district_id, unit_count) in &variant.unit_counts {
-        if let Some(d) = cfg.city.districts.iter_mut().find(|d| d.id == *district_id) {
-            d.unit_count = *unit_count;
+    pub fn with_duration(mut self, dur: u64) -> Self {
+        self.sim_duration_override = Some(dur);
+        self
+    }
+
+    pub fn with_record_routes(mut self, rr: bool) -> Self {
+        self.record_routes_override = Some(rr);
+        self
+    }
+
+    pub fn variants(&self) -> &[Variant] { &self.variants }
+
+    /// Compute the per-variant DB path. If the pattern contains `{}` it is
+    /// replaced with the variant index; otherwise the pattern is returned
+    /// as-is (useful for single-variant batches).
+    fn db_path_for(&self, idx: usize) -> String {
+        if self.db_pattern.contains("{}") {
+            self.db_pattern.replace("{}", &idx.to_string())
+        } else {
+            self.db_pattern.clone()
         }
     }
 
-    if let Some(end) = sim_end {
-        cfg.city.sim.duration_minutes = end;
-    }
-    cfg.city.sim.record_routes = false;
+    /// Run every variant in parallel (rayon par_iter). Returns one result per
+    /// variant, in input order. Per-variant progress and completion lines are
+    /// printed to stdout in the same format as the legacy whatif runners.
+    pub fn run(&self) -> Vec<Result<VariantResult, String>> {
+        let n = self.variants.len();
 
-    if let Some(routes_path) = &variant.patrol_routes_path {
-        cfg.city.patrol = Some(crate::config::PatrolConfig {
-            routes_path: Some(routes_path.clone()),
-        });
-    }
-    if let Some(enabled) = variant.mutual_aid {
-        cfg.city.sim.mutual_aid_enabled = Some(enabled);
+        let mut indexed: Vec<(usize, Result<VariantResult, String>)> = self.variants
+            .par_iter()
+            .enumerate()
+            .map(|(i, variant)| {
+                let db_path = self.db_path_for(i);
+                let started = Instant::now();
+                let label   = variant.name.clone();
+
+                let progress = move |elapsed: u64, sim_end: u64| {
+                    let pct = if sim_end == 0 { 0.0 } else { (elapsed as f64 / sim_end as f64) * 100.0 };
+                    println!("  [{:>3}/{n}] {:<40} sim {:>5.1}%", i + 1, label, pct);
+                };
+
+                let res = self.run_one(variant, &db_path, Some(&progress));
+
+                match &res {
+                    Ok(r)  => println!("  [{:>3}/{n}] {:<40} done ({}s) — SLA overall: {:.1}%",
+                                       i + 1, variant.name, started.elapsed().as_secs(), r.overall_sla_pct()),
+                    Err(e) => println!("  [{:>3}/{n}] {:<40} FAILED: {e}",
+                                       i + 1, variant.name),
+                }
+                (i, res)
+            })
+            .collect();
+
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
     }
 
-    Ok(cfg)
+    /// Build the per-variant `LoadedConfig`, instantiate a `City`, run the
+    /// event loop, drain SLA results.
+    fn run_one(
+        &self,
+        variant:  &Variant,
+        db_path:  &str,
+        progress: Option<&(dyn Fn(u64, u64) + Sync)>,
+    ) -> Result<VariantResult, String> {
+        let cfg = self.materialise_variant_config(variant);
+
+        let total_units = cfg.city.districts.iter().map(|d| d.unit_count).sum::<u32>();
+
+        let mut city = City::from_config_with_engines(
+            &cfg,
+            db_path,
+            Arc::clone(&self.cache),
+            Arc::clone(&self.engines),
+        );
+        run_event_loop(&mut city, cfg.city.sim.duration_minutes, progress);
+
+        extract_sla(db_path, &variant.name, total_units)
+            .map_err(|e| format!("SLA extraction: {e}"))
+    }
+
+    /// Apply this batch's overrides plus the variant's overrides on top of a
+    /// fresh clone of the base config.
+    fn materialise_variant_config(&self, variant: &Variant) -> LoadedConfig {
+        let mut cfg = self.cfg.clone();
+
+        if let Some(counts) = &variant.unit_counts {
+            for (district_id, unit_count) in counts {
+                if let Some(d) = cfg.city.districts.iter_mut().find(|d| d.id == *district_id) {
+                    d.unit_count = *unit_count;
+                }
+            }
+        }
+
+        if let Some(end) = self.sim_duration_override {
+            cfg.city.sim.duration_minutes = end;
+        }
+
+        if let Some(rr) = self.record_routes_override {
+            cfg.city.sim.record_routes = rr;
+        }
+
+        if let Some(routes_path) = &variant.patrol_routes_path {
+            cfg.city.patrol = Some(crate::config::PatrolConfig {
+                routes_path: Some(routes_path.clone()),
+            });
+        }
+        if let Some(enabled) = variant.mutual_aid {
+            cfg.city.sim.mutual_aid_enabled = Some(enabled);
+        }
+
+        cfg
+    }
 }
 
-fn run_sim(
+/// The single canonical event loop. Used by `SimBatch::run_one` and nothing
+/// else. `progress` is invoked every ~10k ticks plus once at the end so the
+/// consumer always sees a terminal update.
+fn run_event_loop(
     city: &mut City,
     sim_end_min: u64,
     progress: Option<&(dyn Fn(u64, u64) + Sync)>,
 ) {
-    // Mirror the standard sim's progress cadence: a callback every ~10k ticks.
-    // 10k events is a good interval — frequent enough to feel live, infrequent
-    // enough that the println cost is negligible relative to the work.
     const PROGRESS_EVERY: u64 = 10_000;
     let mut tick: u64 = 0;
     loop {
@@ -181,7 +306,6 @@ fn run_sim(
         }
     }
     if let Some(cb) = progress {
-        // Final 100% tick so the consumer always sees a terminal update.
         cb(sim_end_min.min(city.clock.elapsed_min), sim_end_min);
     }
     city.flush();
@@ -332,20 +456,20 @@ pub fn generate_patrol_variants(
     out.push(Variant::realloc("Baseline (no patrol, no aid)", baseline_counts.clone()));
     out.push(Variant {
         name:               "Mutual aid only".to_string(),
-        unit_counts:        baseline_counts.clone(),
+        unit_counts:        Some(baseline_counts.clone()),
         patrol_routes_path: None,
         mutual_aid:         Some(true),
     });
     for (label, path) in patrol_route_paths {
         out.push(Variant {
             name:               format!("Patrol: {label}"),
-            unit_counts:        baseline_counts.clone(),
+            unit_counts:        Some(baseline_counts.clone()),
             patrol_routes_path: Some(path.clone()),
             mutual_aid:         Some(false),
         });
         out.push(Variant {
             name:               format!("Patrol: {label} + aid"),
-            unit_counts:        baseline_counts.clone(),
+            unit_counts:        Some(baseline_counts.clone()),
             patrol_routes_path: Some(path.clone()),
             mutual_aid:         Some(true),
         });

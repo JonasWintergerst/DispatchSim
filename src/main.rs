@@ -2,8 +2,11 @@ use std::path::Path;
 use std::process;
 use std::time::Instant;
 
-use dispatch_sim::city::City;
 use dispatch_sim::config::LoadedConfig;
+use dispatch_sim::whatif::{
+    generate_patrol_variants, generate_reallocation_variants, print_comparison_table, SimBatch,
+    Variant, VariantResult,
+};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -37,7 +40,15 @@ fn main() {
         return;
     }
 
-    let config_path = resolve_config_path();
+    run_standard(&args);
+}
+
+// ---------------------------------------------------------------------------
+// Standard sim — a SimBatch with one identity variant
+// ---------------------------------------------------------------------------
+
+fn run_standard(args: &[String]) {
+    let config_path = resolve_config_path(args);
 
     println!("Loading config from: {}", config_path.display());
 
@@ -54,55 +65,16 @@ fn main() {
     );
 
     let setup_start = Instant::now();
-    let city = City::from_config(&cfg);
+    let batch = SimBatch::from_config(cfg)
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); })
+        .with_variants(vec![Variant::identity("Standard sim")])
+        .with_db_pattern("./output/dispatch_sim.db");
     let setup_ms = setup_start.elapsed().as_millis();
+    println!("Batch ready  [{setup_ms} ms setup]");
 
-    println!(
-        "City ready — {} districts, {} total units  [{setup_ms} ms setup]",
-        city.districts.len(),
-        city.districts.iter().map(|d| d.units.len()).sum::<usize>(),
-    );
-
-    run(city, &cfg);
-}
-
-// ---------------------------------------------------------------------------
-// Sim loop
-// ---------------------------------------------------------------------------
-
-fn run(mut city: City, cfg: &LoadedConfig) {
-    let sim_end = cfg.city.sim.duration_minutes;
-    let log_every = 10_000;
-
-    println!("Starting sim — {} min simulated time", sim_end);
-    let now = Instant::now();
-
-    let mut tick = 0u64;
-    loop {
-        if city.event_heap.is_empty() || city.clock.elapsed_min >= sim_end {
-            break;
-        }
-
-        city.tick();
-        tick += 1;
-
-        if tick % log_every == 0 {
-            let pct = (city.clock.elapsed_min as f64 / sim_end as f64) * 100.0;
-            println!(
-                "  event {:>10} — sim time: day {}, {:02}:{:02} — {:.1}%",
-                tick,
-                city.clock.elapsed_min / 1440,
-                city.clock.hour_of_day(),
-                city.clock.elapsed_min % 60,
-                pct,
-            );
-        }
-    }
-
-    city.flush();
-
-    let time = now.elapsed().as_millis() as i32;
-    println!("Sim complete in: {}ms — {} events processed.", time, tick);
+    let started = Instant::now();
+    let results = batch.run();
+    finalise(results, started);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +82,12 @@ fn run(mut city: City, cfg: &LoadedConfig) {
 // ---------------------------------------------------------------------------
 
 fn run_whatif(args: &[String]) {
-    use std::sync::Arc;
-    use rayon::prelude::*;
-    use dispatch_sim::whatif::{generate_reallocation_variants, run_variant_with_cache, print_comparison_table};
-
     let config_path = args.get(2).map(String::as_str).unwrap_or("config/city.toml");
     let max_variants: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10);
     let delta: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(2);
-    // Optional: shorter sim duration for fast iteration (in minutes)
     let sim_duration: Option<u64> = args.get(5).and_then(|s| s.parse().ok());
 
-    let cfg = dispatch_sim::config::LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
+    let cfg = LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         process::exit(1);
     });
@@ -141,67 +108,22 @@ fn run_whatif(args: &[String]) {
         println!("  Sim duration: {d} min (shortened)");
     }
 
-    // Load the routing cache once and share it across all parallel workers.
-    // Every variant deserialises its own `RoutingEngine` from the snapshots,
-    // but the bincode decode of the cache file itself happens exactly once.
-    let cache_path = cfg.city.sim.routing_cache_path.as_deref().unwrap_or_else(|| {
-        eprintln!("error: sim.routing_cache_path is not set in {config_path}");
-        process::exit(1);
-    });
-    let cache = Arc::new(
-        dispatch_sim::routing_cache::load(cache_path).unwrap_or_else(|| {
-            eprintln!("error: routing cache not found at {cache_path} — run `cargo run --bin optimize` first");
-            process::exit(1);
-        }),
-    );
-
     let variants = generate_reallocation_variants(&base_counts, delta, max_variants);
     let n_variants = variants.len();
     println!("\nGenerated {n_variants} variants. Running simulations in parallel…\n");
 
-    let config_p = Path::new(config_path);
-    let batch_start = Instant::now();
+    let mut batch = SimBatch::from_config(cfg)
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); })
+        .with_variants(variants)
+        .with_db_pattern("./output/whatif_{}.db")
+        .with_record_routes(false);
+    if let Some(d) = sim_duration {
+        batch = batch.with_duration(d);
+    }
 
-    // Parallelise across variants. Each worker owns its own `City` and its own
-    // SQLite DB (per-variant path), so there is no shared mutable state beyond
-    // the read-only `Arc<LoadedRoutingCache>`. Determinism is preserved because
-    // every variant re-seeds from `cfg.city.sim.rng_seed`, which is constant.
-    let mut indexed: Vec<(usize, Result<dispatch_sim::whatif::VariantResult, String>)> = variants
-        .par_iter()
-        .enumerate()
-        .map(|(i, variant)| {
-            let db_path = format!("./output/whatif_{i}.db");
-            let now = Instant::now();
-            let label = variant.name.clone();
-            let progress = move |elapsed: u64, sim_end: u64| {
-                let pct = if sim_end == 0 { 0.0 } else { (elapsed as f64 / sim_end as f64) * 100.0 };
-                println!("  [{:>3}/{n_variants}] {:<40} sim {:>5.1}%", i + 1, label, pct);
-            };
-            let res = run_variant_with_cache(
-                config_p,
-                variant,
-                &db_path,
-                sim_duration,
-                Arc::clone(&cache),
-                Some(&progress),
-            );
-            match &res {
-                Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
-                                   i + 1, variant.name, now.elapsed().as_secs(), r.overall_sla_pct()),
-                Err(e) => println!("  [{:>3}/{n_variants}] {:<40} FAILED: {e}",
-                                   i + 1, variant.name),
-            }
-            (i, res)
-        })
-        .collect();
-
-    // Sort by variant index so output order is deterministic regardless of
-    // the order rayon happened to complete them in.
-    indexed.sort_by_key(|(i, _)| *i);
-    let mut results: Vec<_> = indexed.into_iter().filter_map(|(_, r)| r.ok()).collect();
-
-    println!("\nBatch complete in {}s.", batch_start.elapsed().as_secs());
-    print_comparison_table(&mut results);
+    let started = Instant::now();
+    let results = batch.run();
+    finalise(results, started);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,13 +131,8 @@ fn run_whatif(args: &[String]) {
 // ---------------------------------------------------------------------------
 
 fn run_whatif_patrol(args: &[String]) {
-    use std::sync::Arc;
-    use rayon::prelude::*;
-    use dispatch_sim::whatif::{generate_patrol_variants, run_variant_with_cache, print_comparison_table};
-
     let config_path = args.get(2).map(String::as_str).unwrap_or("config/city.toml");
 
-    // Parse remaining args: --strategy <label> (repeatable), --no-aid, [duration_min]
     let mut strategy_filter: Vec<String> = Vec::new();
     let mut include_aid = true;
     let mut sim_duration: Option<u64> = None;
@@ -241,7 +158,7 @@ fn run_whatif_patrol(args: &[String]) {
         }
     }
 
-    let cfg = dispatch_sim::config::LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
+    let cfg = LoadedConfig::load(Path::new(config_path)).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         process::exit(1);
     });
@@ -291,17 +208,6 @@ fn run_whatif_patrol(args: &[String]) {
         println!("  Sim duration: {d} min (shortened)");
     }
 
-    let cache_path = cfg.city.sim.routing_cache_path.as_deref().unwrap_or_else(|| {
-        eprintln!("error: sim.routing_cache_path is not set in {config_path}");
-        process::exit(1);
-    });
-    let cache = Arc::new(
-        dispatch_sim::routing_cache::load(cache_path).unwrap_or_else(|| {
-            eprintln!("error: routing cache not found at {cache_path} — run `cargo run --bin optimize` first");
-            process::exit(1);
-        }),
-    );
-
     let mut variants = generate_patrol_variants(&base_counts, &route_paths);
     if !include_aid {
         variants.retain(|v| {
@@ -311,51 +217,50 @@ fn run_whatif_patrol(args: &[String]) {
     let n_variants = variants.len();
     println!("\nGenerated {n_variants} variants. Running simulations in parallel…\n");
 
-    let config_p = Path::new(config_path);
-    let batch_start = Instant::now();
+    let mut batch = SimBatch::from_config(cfg)
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); })
+        .with_variants(variants)
+        .with_db_pattern("./output/whatif_patrol_{}.db")
+        .with_record_routes(false);
+    if let Some(d) = sim_duration {
+        batch = batch.with_duration(d);
+    }
 
-    let mut indexed: Vec<(usize, Result<dispatch_sim::whatif::VariantResult, String>)> = variants
-        .par_iter()
-        .enumerate()
-        .map(|(i, variant)| {
-            let db_path = format!("./output/whatif_patrol_{i}.db");
-            let now = Instant::now();
-            let label = variant.name.clone();
-            let progress = move |elapsed: u64, sim_end: u64| {
-                let pct = if sim_end == 0 { 0.0 } else { (elapsed as f64 / sim_end as f64) * 100.0 };
-                println!("  [{:>3}/{n_variants}] {:<40} sim {:>5.1}%", i + 1, label, pct);
-            };
-            let res = run_variant_with_cache(
-                config_p,
-                variant,
-                &db_path,
-                sim_duration,
-                Arc::clone(&cache),
-                Some(&progress),
-            );
-            match &res {
-                Ok(r)  => println!("  [{:>3}/{n_variants}] {:<40} done ({}s) — SLA overall: {:.1}%",
-                                   i + 1, variant.name, now.elapsed().as_secs(), r.overall_sla_pct()),
-                Err(e) => println!("  [{:>3}/{n_variants}] {:<40} FAILED: {e}",
-                                   i + 1, variant.name),
-            }
-            (i, res)
-        })
-        .collect();
+    let started = Instant::now();
+    let results = batch.run();
+    finalise(results, started);
+}
 
-    indexed.sort_by_key(|(i, _)| *i);
-    let mut results: Vec<_> = indexed.into_iter().filter_map(|(_, r)| r.ok()).collect();
+// ---------------------------------------------------------------------------
+// Result handling — single-line summary for batches of 1, table otherwise
+// ---------------------------------------------------------------------------
 
-    println!("\nBatch complete in {}s.", batch_start.elapsed().as_secs());
-    print_comparison_table(&mut results);
+fn finalise(results: Vec<Result<VariantResult, String>>, started: Instant) {
+    let mut ok: Vec<VariantResult> = results.into_iter().filter_map(|r| r.ok()).collect();
+    let elapsed = started.elapsed().as_secs();
+
+    if ok.len() == 1 {
+        let r = &ok[0];
+        println!(
+            "\nSim complete in {}s — SLA overall: {:.1}%  (A: {:.1}%, B: {:.1}%, C: {:.1}%)",
+            elapsed,
+            r.overall_sla_pct(),
+            r.sla_a.pct(),
+            r.sla_b.pct(),
+            r.sla_c.pct(),
+        );
+    } else {
+        println!("\nBatch complete in {elapsed}s.");
+        print_comparison_table(&mut ok);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Config path resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_config_path() -> std::path::PathBuf {
-    if let Some(path) = std::env::args().nth(1) {
+fn resolve_config_path(args: &[String]) -> std::path::PathBuf {
+    if let Some(path) = args.get(1) {
         return std::path::PathBuf::from(path);
     }
 
