@@ -85,20 +85,27 @@ impl PatrolRoute {
     /// Build a route from a sequence of waypoints, computing segment durations
     /// from the routing engine. The route is closed automatically: if the last
     /// waypoint differs from the first, a closing segment is appended.
+    ///
+    /// Returns `None` if `waypoints` is empty — a route with no points cannot
+    /// be patrolled. A single-waypoint route is allowed (degenerate, the unit
+    /// just stands at that point).
     pub fn from_waypoints(
         id:        PatrolRouteId,
         mut waypoints: Vec<NodeId>,
         routing:   &RoutingEngine,
-    ) -> Self {
+    ) -> Option<Self> {
+        if waypoints.is_empty() {
+            return None;
+        }
         if waypoints.len() < 2 {
             // Degenerate route: a single point. Total = 0, no segments.
-            return Self {
+            return Some(Self {
                 id,
                 waypoints,
                 segment_durations_min: Vec::new(),
                 cumulative_min:        vec![0],
                 total_min:             0,
-            };
+            });
         }
 
         if waypoints.first() != waypoints.last() {
@@ -119,20 +126,20 @@ impl PatrolRoute {
             cumulative_min.push(acc);
         }
 
-        Self {
+        Some(Self {
             id,
             waypoints,
             segment_durations_min,
             cumulative_min,
             total_min: acc.max(1),
-        }
+        })
     }
 
     /// Position of a unit that started this loop at `started_at` and is now at
     /// `now`. Snaps to the *origin* waypoint of the segment currently being
     /// traversed (NodeIds are discrete, so we don't interpolate).
     pub fn position_at(&self, started_at_min: u64, now_min: u64) -> NodeId {
-        if self.waypoints.is_empty() { panic!("empty patrol route"); }
+        debug_assert!(!self.waypoints.is_empty(), "PatrolRoute invariant: waypoints non-empty (enforced by from_waypoints)");
         if self.total_min == 0 || self.waypoints.len() == 1 {
             return self.waypoints[0];
         }
@@ -186,21 +193,31 @@ pub fn load_routes(
 
     let mut out: PatrolRouteSet = HashMap::new();
     let mut next_id: u32 = 0;
-    for entry in file.routes {
+    for (entry_idx, entry) in file.routes.into_iter().enumerate() {
         let did = DistrictId::new(entry.district_id);
         let Some(routing) = routings.get(&did) else {
             // No matching district — silently skip.
             continue;
         };
         if entry.waypoints.len() < 2 {
+            eprintln!(
+                "warning: patrol route #{} (district {}) has {} waypoint(s); need >= 2, skipping",
+                entry_idx, entry.district_id, entry.waypoints.len()
+            );
             continue;
         }
         let waypoints: Vec<NodeId> = entry.waypoints.iter().copied().map(NodeId::new).collect();
-        let route = PatrolRoute::from_waypoints(
+        let Some(route) = PatrolRoute::from_waypoints(
             PatrolRouteId::new(next_id),
             waypoints,
             routing,
-        );
+        ) else {
+            eprintln!(
+                "warning: patrol route #{} (district {}) failed to compile, skipping",
+                entry_idx, entry.district_id
+            );
+            continue;
+        };
         next_id += 1;
         out.entry(did).or_default().push(Arc::new(route));
     }

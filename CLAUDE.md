@@ -40,16 +40,19 @@ cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # step 3: report
 
 ## Architecture
 
-**dispatch_sim** is a discrete-event simulation of emergency services (Fire/Police/Ambulance) dispatch across a city divided into districts. Time is measured in simulated minutes and advances only when events are processed (no fixed-timestep loop).
+**dispatch_sim** is a discrete-event simulation of emergency services dispatch across a city divided into districts. Time is measured in simulated minutes and advances only when events are processed (no fixed-timestep loop).
+
+> **Scope: police only.** This simulator models **police dispatch** exclusively. Every incident requires exactly one unit, `IncidentKind` variants are crime categories, and there is no multi-unit coordination logic, apparatus types, or fire/EMS-specific state. Do not propose changes shaped around fire/EMS dispatch (multi-unit response, apparatus mixing, BLS/ALS, etc.) — they don't apply here.
 
 ### Event Loop
 
 `City` owns a `BinaryHeap<Reverse<SimEvent>>` as the event queue. Each call to `City::tick()`:
 1. Pops all events at the minimum timestamp
 2. Groups them by `DistrictId`
-3. Dispatches each district's event batch **in parallel** via Rayon (districts share no mutable state during processing)
-4. Collects follow-on `SimEvent`s returned by districts and pushes them back to the heap
-5. Logs `Event` records to SQLite via `EventLog`
+3. Dispatches each district's event batch sequentially (per-tick Rayon overhead dominates the work; parallelism happens at the whole-simulation level instead — see Key Design Decisions)
+4. Collects follow-on `SimEvent`s and `MutualAidRequest`s returned by districts; mutual-aid requests are matched against neighbouring districts in a post-tick pass and lender units are dispatched cross-border
+5. Pushes follow-on events back to the heap
+6. Logs `Event` records to SQLite via `EventLog`
 
 ### Module Roles
 
@@ -72,6 +75,7 @@ cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # step 3: report
 - **UnitArrival** → stale-check `dispatch_id`; if valid, set unit to `OnScene`, sample resolution duration, emit `IncidentResolve`
 - **IncidentResolve** → mark incident `Resolved`; check `pending_queue` for waiting incidents — if found, dispatch unit directly from scene; otherwise emit `UnitReturn` and set unit to `Returning`
 - **UnitReturn** → stale-check `dispatch_id`; if valid, move unit to home station, set `Idle`; check `pending_queue` and dispatch immediately if something is waiting
+- **PatrolLoop** → stale-check `dispatch_id`; if the unit is still patrolling, schedule the next loop tick; the unit's actual position is computed lazily on demand from `patrol_started_at + route.cumulative_min` (no per-tick work)
 - **ShiftChange** → log shift boundary, reschedule next `ShiftChange` at `now + 480 min`; hook for future crew-rotation logic
 
 ### Dispatch Priority & Preemption
@@ -86,7 +90,19 @@ Units are assigned using this precedence on every `IncidentSpawn`:
 
 ### Stale-Event Detection
 
-Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` or `start_return()` call. `UnitArrival` and `UnitReturn` events embed the `dispatch_id` at the time of scheduling. When these events fire, the handler compares the event's `dispatch_id` against the unit's current value — a mismatch means the unit was reassigned and the event is silently discarded. This avoids the need to remove events from the heap.
+Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()`, `start_return()`, or `start_patrol()` call. `UnitArrival`, `UnitReturn`, and `PatrolLoop` events embed the `dispatch_id` at the time of scheduling. When these events fire, the handler compares the event's `dispatch_id` against the unit's current value — a mismatch means the unit was reassigned and the event is silently discarded. This avoids the need to remove events from the heap.
+
+### Patrol Routes
+
+Units configured as patrol units cycle through a closed loop of waypoints (`PatrolRoute` in `src/patrol.rs`). Routes are produced offline by the `patrol_gen` binary against a chosen `PatrolStrategy` (`hotspot`, `border`, etc.) and serialised to `config/patrol_routes_<strategy>.json`. The simulator loads them at startup via `patrol::load_routes`, compiling segment travel times against the routing cache.
+
+Position-while-patrolling is **lazy**: the unit stores `patrol_started_at` and a shared `Arc<PatrolRoute>`, and `Unit::current_position(now)` walks `cumulative_min` to find the segment currently being traversed (O(log N), no shared state). There is no per-tick patrol update — only the periodic `PatrolLoop` event keeps the dispatch_id fresh.
+
+When a patrolling unit is dispatched, `Unit::dispatch` snaps the persistent `position` to the lazy patrol position so travel-time computation starts from the right place.
+
+### Mutual Aid
+
+When a district cannot service an incident locally (no idle/returning unit and no preemptable lower-priority dispatch), it emits a `MutualAidRequest` alongside its events for the tick. After all districts process their batches, `City` runs a post-tick pass: for each request it scans neighbouring districts (within `mutual_aid_max_min` travel minutes), picks the closest idle or patrolling unit, and synthesises a cross-border dispatch on the lender's behalf via `try_accept_loan`. The lender's unit carries `loaned_to: Some(borrower_district)`, and on resolve a synthetic `IncidentResolve` is routed back to the original owner so its bookkeeping stays consistent. The lender unit returns to its own home station, not the borrower's. Lender selection is greedy by travel time and does not load-balance across candidate districts.
 
 ### Configuration
 
@@ -104,8 +120,6 @@ Every `Unit` carries a `dispatch_id: u32` that increments on each `dispatch()` o
 ### Known Gaps / Planned Work
 
 - `ShiftChange` logs boundaries but does not yet rotate crews or change unit availability
-- Patrol routes are not yet modelled — open question on route generation and mid-patrol position
-- Inter-district mutual aid is scaffolded (`DistrictMsg` in `types.rs`) but not wired up
 - `ratatui` (TUI) is a dependency planned for live visualization but not yet wired up
 - Optimizer uses haversine distance proxy for the p-median objective; a road-network travel-time matrix would give more accurate results but requires full Dijkstra over the OSM graph
 - Parallelization strategy (Design.txt §4): precompute routing once in the optimizer and parallelise across whole simulations (one thread per sim), not across districts within a sim. ✅ implemented — cache produced by `optimize`, consumed by `dispatch_sim` and `whatif` batch runner.

@@ -71,6 +71,13 @@ impl Unit {
             self.position = self.current_position(time);
             self.patrol_started_at = None;
         }
+        // Any prior loan is voided by a fresh dispatch. Without this, a unit
+        // that was previously dispatched on loan and is now being preempted by
+        // a higher-priority *local* incident would still appear loaned, and
+        // the resolve handler would route the synthetic cleanup back to the
+        // wrong (foreign) district. `try_dispatch_pending` re-sets `loaned_to`
+        // immediately afterwards if the new dispatch is itself a loan.
+        self.loaned_to = None;
         self.dispatch_id += 1;
         self.status = UnitStatus::Dispatched;
         self.dispatch_time = Some(time);
