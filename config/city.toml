@@ -90,7 +90,7 @@ patrol_units = 1
 [[districts]]
 id           = 2
 name         = "PK 13"
-unit_count   = 6
+unit_count   = 11
 patrol_units = 1
 
 [[districts]]
@@ -156,7 +156,7 @@ patrol_units = 1
 [[districts]]
 id           = 13
 name         = "PK 27"
-unit_count   = 4
+unit_count   = 6
 patrol_units = 1
 
 [[districts]]
