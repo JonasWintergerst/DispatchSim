@@ -121,6 +121,7 @@ Measured on AMD Ryzen 5 2600 (6 cores, 3.4 GHz), 16 GB RAM, Windows 11 — relea
 | Phase | Time |
 |-------|------|
 | Optimizer (OSM load, p-median, adjacency, repair) | **14.2 s** |
+| Routing cache build (Dijkstra, 8 065 anchors) | **~8 min** |
 | Simulator setup (routing cache load) | **0.8 s** |
 | 4-year simulation (~1.63 M events) | **93.8 s** (~17.4 k events/s) |
 | Peak memory | **~220 MB** |
@@ -130,6 +131,27 @@ cargo build --release
 cargo run --release --bin optimize   -- config/optimize.toml
 cargo run --release --bin dispatch_sim -- config/city.toml
 ```
+
+### Dijkstra routing benchmarks
+
+The optimizer builds a city-wide routing cache (`output/routing_cache.bin`) by running Dijkstra from every anchor node (hex + station) on the full OSM graph. This is the most expensive step and is paid once per optimization run — the simulator loads the precomputed cache directly.
+
+Benchmarked with `cargo run --release --bin bench_dijkstra -- config/hamburg-latest.osm.pbf config/hexes.json`:
+
+| Operation | Time | Notes |
+|-----------|------|-------|
+| OSM PBF load → petgraph | 4.0 s | 757 k nodes, 1.7 M edges |
+| Single-source Dijkstra (full graph) | ~250 ms | 750 k reachable nodes per run |
+| Bounded Dijkstra (max 10 min) | ~0.02 ms/node | Early cutoff, very fast |
+| Bounded batch (8 065 hex nodes) | 0.03 s (parallel) | Negligible |
+| **RoutingEngine::from_graph** | | |
+| — 10 anchors | 0.6 s | 63 ms/anchor |
+| — 50 anchors | 2.7 s | 55 ms/anchor |
+| — 100 anchors | 5.2 s | 52 ms/anchor |
+| — 500 anchors | 25.0 s | 50 ms/anchor |
+| — 8 065 anchors (all) | **481.7 s (~8 min)** | 60 ms/anchor |
+
+The routing cache build scales linearly: **~60 ms × N anchors** (parallelised via Rayon). Potential optimizations: contraction hierarchies, anchor subset sampling, or a hub-labelling index.
 
 ---
 

@@ -33,3 +33,7 @@ path = "src/bin/optimize.rs"
 [[bin]]
 name = "dashboard"
 path = "src/bin/dashboard/main.rs"
+
+[[bin]]
+name = "bench_dijkstra"
+path = "src/bin/bench_dijkstra.rs"
