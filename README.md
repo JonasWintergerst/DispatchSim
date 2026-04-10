@@ -31,7 +31,7 @@ Built in Rust. Uses real OpenStreetMap road data and H3 geospatial indexing.
 - **Mutual aid** — when a district has no local unit available, neighbouring districts within a configurable travel-time radius can lend an idle or patrolling unit; the lender's unit returns home after resolving
 - **Queue escalation** — pending incidents that wait too long get their priority automatically bumped (C→B after 30 min, B→A after 15 min), making them eligible for preemption; low-priority calls waiting beyond a cancellation threshold may self-resolve (caller hangs up), matching real-world dispatcher rebatch and call-abandonment patterns
 - **Patrol routes** — units configured as patrol units cycle through pre-generated waypoint loops between calls; position is computed lazily (no per-tick work)
-- Incident demand driven by per-hex Poisson processes with hour-of-day, day-of-week, and season multipliers calibrated to German/EU policing benchmarks (~300 calls/day for a city of 300 000)
+- Incident demand driven by per-hex Poisson processes with hour-of-day, day-of-week, and season multipliers calibrated to German/EU policing benchmarks (~300 calls/day for a city of 300 000). Each incident is placed at a random road node within its H3 cell (not just the cell's anchor node), spreading demand realistically across the road network
 - Districts process events in parallel via Rayon; the event heap is shared
 - All events logged to a SQLite database for post-hoc analysis
 
@@ -63,7 +63,7 @@ src/
 ├── routing.rs               # RoadGraph (petgraph), RoutingEngine, Dijkstra travel matrix
 ├── osm.rs                   # OSM PBF parser → RoadGraph + R-tree + police station extraction
 ├── spawner.rs               # Exponential inter-arrival + SpawnProfile scaling
-├── hex.rs                   # Hex struct (H3 index, lat/lon, district, OSM node)
+├── hex.rs                   # Hex struct (H3 index, lat/lon, district, road nodes)
 ├── unit.rs                  # Unit state machine
 ├── incident.rs              # Incident record
 ├── station.rs               # Station struct
@@ -96,7 +96,8 @@ simulator:
 ### Event flow (per district, per tick)
 
 ```
-IncidentSpawn    →  dispatch best idle/patrolling/returning/preemptable unit  →  UnitArrival
+IncidentSpawn    →  pick random road node in hex, create incident,            →  UnitArrival
+                    dispatch best idle/patrolling/returning/preemptable unit
                     if no unit: push to pending queue + emit MutualAidRequest
 UnitArrival      →  unit OnScene, sample duration                             →  IncidentResolve
 IncidentResolve  →  unit returns or takes next pending incident               →  UnitReturn / UnitArrival
@@ -232,7 +233,7 @@ patrol_units = 2
 
 ### `config/hexes.json`
 
-Flat JSON array produced by the optimizer — one entry per H3 cell:
+Flat JSON array produced by the optimizer — one entry per H3 cell. The `nearest_osm_node` serves as the routing anchor; at startup the simulator discovers all road nodes within each H3 cell boundary and uses them as possible incident spawn locations:
 
 ```json
 [

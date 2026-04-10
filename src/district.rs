@@ -58,8 +58,8 @@ pub struct District {
     pub station:      Station,
     pub units:        Vec<Unit>,
     pub hexes:        Vec<Hex>,
-    /// O(1) lookup: hex_id → (road_node, spawn_profile_id).
-    hex_lookup:       HashMap<HexId, (NodeId, SpawnProfileId)>,
+    /// O(1) lookup: hex_id → (road_nodes, spawn_profile_id).
+    hex_lookup:       HashMap<HexId, (Vec<NodeId>, SpawnProfileId)>,
     /// Border hexes 8-adjacent to a different district; populated by City after construction.
     pub border_nodes: Vec<BorderNode>,
     /// Only active (non-resolved) incidents are kept here; resolved ones are removed immediately.
@@ -91,7 +91,7 @@ impl District {
         record_routes: bool,
     ) -> Self {
         let hex_lookup = hexes.iter()
-            .map(|h| (h.id, (h.node_id(), h.spawn_profile_id.clone())))
+            .map(|h| (h.id, (h.road_nodes.clone(), h.spawn_profile_id.clone())))
             .collect();
         District {
             id,
@@ -222,10 +222,11 @@ impl District {
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
         out: &mut ProcessOutput,
     ) {
-        let (location, spawn_profile_id) = self.hex_lookup
+        let (road_nodes, spawn_profile_id) = self.hex_lookup
             .get(&hex_id)
-            .map(|(node, profile)| (*node, profile.clone()))
+            .map(|(nodes, profile)| (nodes, profile.clone()))
             .expect("hex_id not found in district");
+        let location = road_nodes[self.rng.random_range(0..road_nodes.len())];
 
         let profile  = &profiles[&spawn_profile_id];
         let kind     = sample_incident_kind(&profile.incident_weights, &mut self.rng);

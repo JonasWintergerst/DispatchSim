@@ -34,15 +34,18 @@ pub struct Hex {
     pub lon:               f64,
     pub district:          DistrictId,
     pub spawn_profile_id:  SpawnProfileId,
-    /// Nearest OSM road node, used as the routing anchor for this hex.
-    /// `None` until snapped to the road network at startup; always `Some` by
-    /// the time the district's routing engine is constructed.
-    pub nearest_road_node: Option<NodeId>,
+    /// OSM road nodes within this hex cell. The first entry is the anchor node
+    /// (nearest to the hex centre, used for precomputed routing). Additional
+    /// entries are other road nodes inside the H3 cell boundary; incident
+    /// spawning picks one at random for spatial realism.
+    pub road_nodes: Vec<NodeId>,
 }
 
 impl Hex {
-    /// Panics if called before the hex has been snapped to the road network.
+    /// Primary anchor node (nearest to hex centre). Used for border detection,
+    /// routing anchor lookups, and anywhere a single representative node is
+    /// needed. Panics if `road_nodes` is empty.
     pub fn node_id(&self) -> NodeId {
-        self.nearest_road_node.expect("node_id() called before hex was snapped to road network")
+        self.road_nodes[0]
     }
 }

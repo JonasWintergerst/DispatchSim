@@ -191,6 +191,16 @@ impl RoutingEngine {
         })
     }
 
+    /// All node IDs with their positions (lon, lat) in the graph.
+    pub fn all_node_positions(&self) -> Vec<(NodeId, f64, f64)> {
+        self.graph.node_indices()
+            .map(|nx| {
+                let n = &self.graph[nx];
+                (n.id, n.position.x(), n.position.y())
+            })
+            .collect()
+    }
+
     /// Extract a serializable snapshot of this engine's graph and precomputed times.
     pub fn to_snapshot(&self) -> RoutingSnapshot {
         let nodes: Vec<(u32, f64, f64)> = self.graph.node_indices().map(|nx| {

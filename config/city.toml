@@ -40,7 +40,7 @@ routing_cache_path = "output/routing_cache.bin"
 # unit available is offered to neighbour districts; the closest free unit
 # (within `mutual_aid_max_min` minutes) is loaned. Off by default to preserve
 # legacy behaviour.
-mutual_aid_enabled = true
+mutual_aid_enabled = false
 mutual_aid_max_min = 8
 
 # Queue escalation — incidents waiting too long get their priority bumped,
@@ -90,7 +90,7 @@ patrol_units = 1
 [[districts]]
 id           = 2
 name         = "PK 13"
-unit_count   = 3
+unit_count   = 4
 patrol_units = 1
 
 [[districts]]
@@ -114,7 +114,7 @@ patrol_units = 3
 [[districts]]
 id           = 6
 name         = "PK 17"
-unit_count   = 3
+unit_count   = 4
 patrol_units = 1
 
 [[districts]]
@@ -174,25 +174,25 @@ patrol_units = 2
 [[districts]]
 id           = 16
 name         = "PK 33"
-unit_count   = 3
+unit_count   = 4
 patrol_units = 1
 
 [[districts]]
 id           = 17
 name         = "PK 34"
-unit_count   = 2
+unit_count   = 4
 patrol_units = 0
 
 [[districts]]
 id           = 18
 name         = "PK 35"
-unit_count   = 2
+unit_count   = 4
 patrol_units = 0
 
 [[districts]]
 id           = 19
 name         = "PK 36"
-unit_count   = 3
+unit_count   = 4
 patrol_units = 1
 
 [[districts]]
@@ -210,13 +210,13 @@ patrol_units = 1
 [[districts]]
 id           = 22
 name         = "PK 43"
-unit_count   = 3
+unit_count   = 4
 patrol_units = 1
 
 [[districts]]
 id           = 23
 name         = "PK 46"
-unit_count   = 2
+unit_count   = 4
 patrol_units = 0
 
 # ---------------------------------------------------------------------------
