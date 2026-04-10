@@ -147,13 +147,7 @@ impl RoutingEngine {
                 let dist_m = haversine_m(fp.y(), fp.x(), tp.y(), tp.x());
                 ((dist_m / SPEED_M_PER_MIN) as u32).max(1)
             }
-            _ => {
-                eprintln!(
-                    "routing: travel_time({:?} → {:?}) node not in graph; using 1 min",
-                    from, to
-                );
-                1
-            }
+            _ => 1,
         }
     }
 
@@ -258,7 +252,6 @@ impl RoutingEngine {
         let (Some(&from_nx), Some(&to_nx)) =
             (self.node_index.get(&from), self.node_index.get(&to))
         else {
-            eprintln!("routing: compute_route({:?} → {:?}) node not in graph", from, to);
             return vec![from, to];
         };
 

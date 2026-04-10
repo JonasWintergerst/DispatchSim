@@ -47,11 +47,8 @@ fn main() {
         process::exit(1);
     });
 
-    // Build a RoutingEngine per district from the cached snapshots.
-    let mut routings: HashMap<u32, Arc<RoutingEngine>> = HashMap::new();
-    for (did, snap) in &cache.snapshots {
-        routings.insert(*did, Arc::new(RoutingEngine::from_snapshot(snap.clone())));
-    }
+    // Build a single city-wide RoutingEngine from the cached snapshot.
+    let routing = Arc::new(RoutingEngine::from_snapshot(cache.city_snapshot.clone()));
 
     // Group hex configs by district, attaching the canonical OSM node from
     // the cache (the cache's anchors are what the routing engine knows about).
@@ -80,7 +77,7 @@ fn main() {
     let mut routes: Vec<PatrolRouteEntry> = Vec::new();
     for d in &cfg.city.districts {
         let Some(hexes) = hexes_by_district.get(&d.id) else { continue; };
-        let Some(routing) = routings.get(&d.id) else { continue; };
+        let routing = &routing;
 
         let waypoints = match strategy {
             "border" => border_waypoints(hexes, DEFAULT_K_PER_ROUTE),

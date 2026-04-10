@@ -114,7 +114,7 @@ When a district cannot service an incident locally (no idle/returning unit and n
 
 - **Strong newtypes for all IDs** (`UnitId(u32)`, `IncidentId(String)`, etc.) — prevents accidental mixing at compile time
 - **Simulations are the unit of parallelism** — `City::tick` processes districts sequentially (they share no mutable state but per-tick Rayon overhead dominates). Throughput comes from running many whole simulations in parallel, one per thread, each reading from a shared `Arc<RoutingEngine>`. The what-if runner (`src/main.rs:run_whatif`) is the canonical example.
-- **Routing is precomputed in the optimizer, not the sim** — the optimizer builds per-district `RoutingEngine` subgraphs after districting and serialises them to `output/routing_cache.bin` via `src/routing_cache.rs`. The simulator refuses to start without this file; it does not load OSM itself. This means every sim invocation starts with zero routing work and many sim variants can be benchmarked cheaply against a single optimized district layout.
+- **Routing is precomputed in the optimizer, not the sim** — the optimizer builds a single city-wide `RoutingEngine` from the full OSM graph (anchored on all hex nodes + station nodes across all districts) and serialises it to `output/routing_cache.bin` via `src/routing_cache.rs`. All districts share one `Arc<RoutingEngine>`, enabling seamless cross-district routing for mutual aid. The simulator refuses to start without this file; it does not load OSM itself.
 - **`SimEvent` vs `Event`** — `SimEvent` drives future scheduling (heap); `Event` is an immutable log record written to SQLite
 
 ### Known Gaps / Planned Work

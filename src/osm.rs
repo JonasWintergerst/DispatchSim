@@ -202,6 +202,28 @@ impl OsmGraph {
         sub
     }
 
+    /// Export the full city-wide graph as a `RoadGraph`, preserving all nodes
+    /// and edges. Used to build a single shared `RoutingEngine` for the
+    /// entire city (cross-district routing for mutual aid).
+    pub fn to_road_graph(&self) -> RoadGraph {
+        let mut out = RoadGraph::new();
+        let mut old_to_new: HashMap<NodeIndex, NodeIndex> = HashMap::with_capacity(self.graph.node_count());
+
+        for nx in self.graph.node_indices() {
+            let node = &self.graph[nx];
+            let new_nx = out.add_node(Node { id: node.id, position: node.position });
+            old_to_new.insert(nx, new_nx);
+        }
+
+        for edge_idx in self.graph.edge_indices() {
+            let (a, b) = self.graph.edge_endpoints(edge_idx).unwrap();
+            let weight = self.graph[edge_idx].travel_time_min;
+            out.add_edge(old_to_new[&a], old_to_new[&b], Edge { travel_time_min: weight });
+        }
+
+        out
+    }
+
     pub fn node_count(&self) -> usize { self.graph.node_count() }
     pub fn edge_count(&self) -> usize { self.graph.edge_count() }
 

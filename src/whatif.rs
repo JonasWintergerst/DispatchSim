@@ -8,7 +8,7 @@
 // reporting, mutual-aid handling, and shared-engine reuse all live in one
 // place.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -114,7 +114,7 @@ impl VariantResult {
 pub struct SimBatch {
     cfg:                   LoadedConfig,
     cache:                 Arc<LoadedRoutingCache>,
-    engines:               Arc<HashMap<u32, Arc<RoutingEngine>>>,
+    engine:                Arc<RoutingEngine>,
     variants:              Vec<Variant>,
     /// Output SQLite path. Use `{}` as a placeholder for the variant index.
     /// Single-variant batches may omit it.
@@ -144,12 +144,12 @@ impl SimBatch {
         let cache = Arc::new(routing_cache::load(cache_path).ok_or_else(|| {
             format!("routing cache not found at {cache_path} — run `cargo run --bin optimize` first")
         })?);
-        let engines = Arc::new(city::build_routing_engines(&cache));
+        let engine = Arc::new(city::build_routing_engine(&cache));
 
         Ok(Self {
             cfg,
             cache,
-            engines,
+            engine,
             variants:               vec![Variant::identity("Default")],
             db_pattern:             "./output/dispatch_sim.db".to_string(),
             sim_duration_override:  None,
@@ -237,11 +237,11 @@ impl SimBatch {
 
         let total_units = cfg.city.districts.iter().map(|d| d.unit_count).sum::<u32>();
 
-        let mut city = City::from_config_with_engines(
+        let mut city = City::from_config_with_engine(
             &cfg,
             db_path,
             Arc::clone(&self.cache),
-            Arc::clone(&self.engines),
+            Arc::clone(&self.engine),
         );
         run_event_loop(&mut city, cfg.city.sim.duration_minutes, progress);
 

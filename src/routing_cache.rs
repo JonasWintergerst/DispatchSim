@@ -11,20 +11,21 @@ use std::path::Path;
 
 use crate::routing::RoutingSnapshot;
 
-/// One entry in the routing cache: `(district_id, snapshot, hex_node_assignments)`
-/// where `hex_node_assignments` is `Vec<(h3_index, nearest_road_node_raw)>`.
-pub type DistrictCacheEntry = (u32, RoutingSnapshot, Vec<(u64, u32)>);
-
 /// On-disk format for the routing cache file.
+/// Contains a single city-wide graph snapshot shared by all districts,
+/// plus per-district hex → OSM node mappings.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct RoutingCacheFile {
-    pub districts: Vec<DistrictCacheEntry>,
+    /// Single city-wide road graph and precomputed anchor travel times.
+    pub city_snapshot: RoutingSnapshot,
+    /// Per-district hex → nearest OSM road node: `(district_id, Vec<(h3_index, node_id_raw)>)`.
+    pub district_hex_nodes: Vec<(u32, Vec<(u64, u32)>)>,
 }
 
 /// In-memory representation of a loaded routing cache.
 pub struct LoadedRoutingCache {
-    /// district_id → RoutingSnapshot
-    pub snapshots: HashMap<u32, RoutingSnapshot>,
+    /// City-wide routing snapshot (one graph for all districts).
+    pub city_snapshot: RoutingSnapshot,
     /// district_id → (h3_index → nearest_road_node raw id)
     pub hex_nodes: HashMap<u32, HashMap<u64, u32>>,
 }
@@ -38,21 +39,20 @@ pub fn load(path: &str) -> Option<LoadedRoutingCache> {
         bincode::config::standard(),
     ).ok()?;
 
-    println!("Loaded routing cache from: {} ({} districts)", path, file.districts.len());
+    let n_districts = file.district_hex_nodes.len();
+    println!("Loaded routing cache from: {} ({} districts, city-wide graph)", path, n_districts);
 
-    let mut snapshots = HashMap::new();
     let mut hex_nodes = HashMap::new();
-    for (did, snap, nodes) in file.districts {
-        snapshots.insert(did, snap);
+    for (did, nodes) in file.district_hex_nodes {
         hex_nodes.insert(did, nodes.into_iter().collect());
     }
-    Some(LoadedRoutingCache { snapshots, hex_nodes })
+    Some(LoadedRoutingCache { city_snapshot: file.city_snapshot, hex_nodes })
 }
 
 /// Write a routing cache file to `path`. Creates parent directories as needed.
-pub fn save(path: &str, entries: Vec<DistrictCacheEntry>) {
-    let count = entries.len();
-    let file = RoutingCacheFile { districts: entries };
+pub fn save(path: &str, city_snapshot: RoutingSnapshot, district_hex_nodes: Vec<(u32, Vec<(u64, u32)>)>) {
+    let n_districts = district_hex_nodes.len();
+    let file = RoutingCacheFile { city_snapshot, district_hex_nodes };
 
     let data = bincode::serde::encode_to_vec(&file, bincode::config::standard())
         .expect("failed to encode routing cache");
@@ -61,5 +61,5 @@ pub fn save(path: &str, entries: Vec<DistrictCacheEntry>) {
         std::fs::create_dir_all(parent).ok();
     }
     std::fs::write(path, data).expect("failed to write routing cache");
-    println!("Saved routing cache to: {} ({} districts)", path, count);
+    println!("Saved routing cache to: {} ({} districts, city-wide graph)", path, n_districts);
 }

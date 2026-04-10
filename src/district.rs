@@ -398,25 +398,32 @@ impl District {
         let was_loaned = self.units[unit_idx].is_loaned();
         let original_owner = self.units[unit_idx].loaned_to;
 
-        out.push((
-            SimEvent::NoOp,
-            Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
-            None,
-        ));
+        // Log IncidentResolved only for locally-owned incidents.  For loaned
+        // units the owning district will log the resolve when it processes the
+        // synthetic IncidentResolve below — logging here too would inflate the
+        // resolved count.
+        if !was_loaned {
+            out.push((
+                SimEvent::NoOp,
+                Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
+                None,
+            ));
+        }
 
         // If this was a loaned incident, notify the original owner so they can
-        // clean up their pending bookkeeping. The synthetic IncidentResolve
-        // will hit the early-return branch above on the owner's side.
+        // clean up their pending bookkeeping.  The synthetic IncidentResolve
+        // will hit the early-return branch above on the owner's side, which
+        // is the single place that logs IncidentResolved for mutual-aid calls.
         if was_loaned {
             if let Some(owner) = original_owner {
                 out.push((
                     SimEvent::IncidentResolve {
                         time, incident_id: incident_id.clone(), district_id: owner,
                     },
-                    // Don't double-log the resolve; the local one above is enough.
-                    // This tuple element is required by Out, so emit a NoOp-ish
-                    // event that distinguishes itself in the SQLite log.
-                    Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: owner, unit: None, incident: Some(incident_id.clone()), priority: None, incident_kind: None },
+                    // Don't log a resolve here — the owner will log it when it
+                    // processes the synthetic event.  Use UnitReturning as a
+                    // lightweight marker so the Out tuple is satisfied.
+                    Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
                     None,
                 ));
             }
