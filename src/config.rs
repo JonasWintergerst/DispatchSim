@@ -107,6 +107,33 @@ pub struct SimConfig {
     /// considered as a mutual-aid lender. Defaults to 8 min.
     #[serde(default)]
     pub mutual_aid_max_min: Option<u32>,
+
+    /// Master switch for queue escalation. When enabled, pending incidents
+    /// that have waited too long get their priority bumped (C→B, B→A), and
+    /// low-priority calls may self-cancel after a longer threshold.
+    #[serde(default)]
+    pub queue_escalation_enabled: Option<bool>,
+
+    /// How often (sim-minutes) the escalation sweep runs per district.
+    #[serde(default)]
+    pub queue_escalation_interval_min: Option<u64>,
+
+    /// Minutes a Priority C incident must wait before escalating to B.
+    #[serde(default)]
+    pub escalation_c_to_b_min: Option<u64>,
+
+    /// Minutes a Priority B incident must wait before escalating to A.
+    #[serde(default)]
+    pub escalation_b_to_a_min: Option<u64>,
+
+    /// Minutes a Priority C incident must wait before it may self-cancel.
+    #[serde(default)]
+    pub cancellation_threshold_min: Option<u64>,
+
+    /// Per-check probability [0.0, 1.0] that a C incident past the
+    /// cancellation threshold resolves itself.
+    #[serde(default)]
+    pub cancellation_probability: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -28,6 +28,9 @@ Built in Rust. Uses real OpenStreetMap road data and H3 geospatial indexing.
 - Reads station locations from `config/districts.json` — units home to real, OSM-snapped station nodes
 - Units cycle through `Idle → Dispatched → OnScene → Returning → Idle`
 - Priority dispatch with preemption (Priority A > B > C)
+- **Mutual aid** — when a district has no local unit available, neighbouring districts within a configurable travel-time radius can lend an idle or patrolling unit; the lender's unit returns home after resolving
+- **Queue escalation** — pending incidents that wait too long get their priority automatically bumped (C→B after 30 min, B→A after 15 min), making them eligible for preemption; low-priority calls waiting beyond a cancellation threshold may self-resolve (caller hangs up), matching real-world dispatcher rebatch and call-abandonment patterns
+- **Patrol routes** — units configured as patrol units cycle through pre-generated waypoint loops between calls; position is computed lazily (no per-tick work)
 - Incident demand driven by per-hex Poisson processes with hour-of-day, day-of-week, and season multipliers calibrated to German/EU policing benchmarks (~300 calls/day for a city of 300 000)
 - Districts process events in parallel via Rayon; the event heap is shared
 - All events logged to a SQLite database for post-hoc analysis
@@ -93,12 +96,18 @@ simulator:
 ### Event flow (per district, per tick)
 
 ```
-IncidentSpawn   →  dispatch best idle/returning/preemptable unit  →  UnitArrival
-UnitArrival     →  unit OnScene, sample duration                  →  IncidentResolve
-IncidentResolve →  unit returns or takes next pending incident    →  UnitReturn / UnitArrival
-UnitReturn      →  unit Idle, drain pending queue
-ShiftChange     →  log shift boundary, reschedule +480 min
+IncidentSpawn    →  dispatch best idle/patrolling/returning/preemptable unit  →  UnitArrival
+                    if no unit: push to pending queue + emit MutualAidRequest
+UnitArrival      →  unit OnScene, sample duration                             →  IncidentResolve
+IncidentResolve  →  unit returns or takes next pending incident               →  UnitReturn / UnitArrival
+UnitReturn       →  unit Idle, drain pending queue, start patrol if assigned
+PatrolLoop       →  refresh patrol cycle (stale-checked via dispatch_id)
+ShiftChange      →  log shift boundary, reschedule +480 min
+QueueEscalation  →  bump priority on long-waiting incidents (C→B, B→A),
+                    cancel stale low-priority calls, retry dispatch
 ```
+
+**Mutual aid (post-tick pass):** after all districts process their batch, the City scans `MutualAidRequest`s and tries to loan a unit from the closest neighbour district (within `mutual_aid_max_min` minutes). The lender unit returns to its own station after resolving.
 
 Stale events (unit reassigned between scheduling and firing) are detected by a `dispatch_id` counter and silently dropped — no heap modification needed.
 
@@ -193,7 +202,7 @@ algorithm = "greedy"
 
 ### `config/city.toml`
 
-Defines districts (id, name, unit count), spawn profiles (λ, hour/weekday/season multipliers, incident type weights), and simulation parameters (duration, RNG seed, OSM path for routing).
+Defines districts (id, name, unit count, patrol units), spawn profiles (λ, hour/weekday/season multipliers, incident type weights), and simulation parameters (duration, RNG seed, OSM path for routing).
 
 Station names and locations are **not** defined here — they come from `config/districts.json` written by the optimizer.
 
@@ -201,10 +210,24 @@ Station names and locations are **not** defined here — they come from `config/
 hex_grid_path  = "config/hexes.json"
 districts_path = "config/districts.json"
 
+[sim]
+duration_minutes       = 2_102_400   # 4 simulated years
+mutual_aid_enabled     = true
+mutual_aid_max_min     = 8           # max travel-time for cross-district lending
+
+# Queue escalation — bump priority on long-waiting incidents, cancel stale ones
+queue_escalation_enabled      = true
+queue_escalation_interval_min = 5    # sweep every 5 sim-minutes
+escalation_c_to_b_min         = 30   # C → B after 30 min waiting
+escalation_b_to_a_min         = 15   # B → A after 15 min waiting
+cancellation_threshold_min    = 60   # C incidents eligible for self-cancel after 60 min
+cancellation_probability      = 0.15 # 15% chance per sweep
+
 [[districts]]
-id         = 0
-name       = "PK 11"
-unit_count = 3
+id           = 0
+name         = "PK 11"
+unit_count   = 7
+patrol_units = 2
 ```
 
 ### `config/hexes.json`
@@ -275,7 +298,7 @@ cargo run --release --bin dispatch_sim -- report output/dispatch_sim.db
 Prints a terminal summary covering:
 
 - **Simulation overview** — duration, total events logged
-- **Incidents** — spawned, resolved, open/queued count
+- **Incidents** — spawned, resolved, escalated, cancelled (self-resolved), open/queued count
 - **SLA compliance** — city-wide and per-district compliance % for Priority A (≤5 min), B (≤15 min), C (≤60 min)
 - **Response time per district** — N, mean, P50, P95, max (spawn → unit arrival, minutes)
 - **On-scene duration** — mean, P50, P95, max (arrival → resolved)
@@ -289,8 +312,6 @@ Prints a terminal summary covering:
 - **Solver**: only the greedy algorithm is implemented; simulated annealing is scaffolded but not yet written
 - **Routing**: the simulator uses real OSM road times via Dijkstra per district; the optimizer uses haversine as a travel-time proxy — a network-distance objective would improve solution quality
 - **Shift changes**: logged but crew rotation not yet modelled
-- **Mutual aid**: inter-district dispatch is scaffolded (`DistrictMsg`) but not wired up
-- **Patrol positions**: units return to station between calls; mid-patrol positioning not modelled
 
 ---
 

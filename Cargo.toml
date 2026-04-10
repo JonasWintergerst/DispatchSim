@@ -19,6 +19,8 @@ osmpbf     = "0.3"
 rstar      = "0.12"
 eframe     = "0.31"
 egui       = "0.31"
+ureq       = "2"
+image      = { version = "0.25", default-features = false, features = ["png"] }
 
 [[bin]]
 name = "dispatch_sim"

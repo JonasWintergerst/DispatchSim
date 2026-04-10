@@ -40,8 +40,21 @@ routing_cache_path = "output/routing_cache.bin"
 # unit available is offered to neighbour districts; the closest free unit
 # (within `mutual_aid_max_min` minutes) is loaned. Off by default to preserve
 # legacy behaviour.
-mutual_aid_enabled = false
+mutual_aid_enabled = true
 mutual_aid_max_min = 8
+
+# Queue escalation — incidents waiting too long get their priority bumped,
+# which lets the existing preemption logic reassign a unit. Low-priority
+# calls that wait beyond a cancellation threshold may self-resolve (caller
+# hangs up, situation resolves itself). Checked every `interval` sim-minutes.
+queue_escalation_enabled      = true
+queue_escalation_interval_min = 5
+# C → B after 30 min waiting; B → A after 15 min waiting
+escalation_c_to_b_min = 30
+escalation_b_to_a_min = 15
+# C incidents waiting > 60 min: 15% chance of cancellation per check
+cancellation_threshold_min = 60
+cancellation_probability   = 0.15
 
 # Phase 2 — patrols. Compiled-in once at startup; the per-district `patrol_units`
 # field below controls how many units in that district patrol when idle.

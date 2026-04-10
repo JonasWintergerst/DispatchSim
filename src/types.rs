@@ -154,6 +154,18 @@ pub struct BorderNode {
     pub neighbour_district: DistrictId,
 }
 
+/// Configuration for the queue-escalation sweep. Passed to districts so they
+/// can bump priorities on long-waiting incidents and cancel stale ones.
+#[derive(Clone, Copy)]
+pub struct EscalationConfig {
+    pub enabled:                  bool,
+    pub interval_min:             u64,
+    pub c_to_b_min:               u64,
+    pub b_to_a_min:               u64,
+    pub cancellation_threshold:   u64,
+    pub cancellation_probability: f64,
+}
+
 /// A request from one district that has no available local unit. Emitted by
 /// `District::process_events` and consumed by the City-level mutual-aid pass
 /// in `City::tick`.

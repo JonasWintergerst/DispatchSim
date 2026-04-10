@@ -26,6 +26,8 @@ pub enum EventKind {
     UnitReturned,
     ShiftStarted,
     PatrolStarted,
+    IncidentEscalated,
+    IncidentCancelled,
 }
 
 impl EventKind {
@@ -40,6 +42,8 @@ impl EventKind {
             EventKind::UnitReturned       => "UnitReturned",
             EventKind::ShiftStarted       => "ShiftStarted",
             EventKind::PatrolStarted      => "PatrolStarted",
+            EventKind::IncidentEscalated  => "IncidentEscalated",
+            EventKind::IncidentCancelled  => "IncidentCancelled",
         }
     }
 }

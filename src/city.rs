@@ -20,13 +20,14 @@ use crate::routing_cache::{self, LoadedRoutingCache};
 use crate::spawner::SpawnProfile;
 use crate::station::Station;
 use crate::types::{
-    BorderNode, DistrictId, HexId, IncidentKind, MutualAidRequest, NodeId, SimType,
-    SpawnProfileId, StationId, UnitId, UnitStatus,
+    BorderNode, DistrictId, EscalationConfig, HexId, IncidentKind, MutualAidRequest, NodeId,
+    SimType, SpawnProfileId, StationId, UnitId, UnitStatus,
 };
 use crate::unit::Unit;
 
 /// Flush buffered log events to SQLite every this many simulated minutes (1 sim-day).
 const FLUSH_EVERY_MINS: u64 = 1_440;
+
 
 pub struct City {
     pub clock:      SimClock,
@@ -44,6 +45,8 @@ pub struct City {
     /// Master switch for the mutual-aid pass. Disabled → behaves exactly like
     /// the pre-Phase-2 simulator.
     mutual_aid_enabled:  bool,
+    /// Queue escalation config, stored centrally and passed to districts.
+    pub escalation_cfg:  EscalationConfig,
 }
 
 impl City {
@@ -77,7 +80,7 @@ impl City {
         for d in self.districts.iter_mut() {
             if !district_batches.contains_key(&d.id) { continue; }
             let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
-            let mut out = d.process_events(batch, profiles);
+            let mut out = d.process_events(batch, profiles, &self.escalation_cfg);
             follow_on.append(&mut out.events);
             all_aid.append(&mut out.aid_requests);
         }
@@ -311,7 +314,26 @@ impl City {
             }
         }
 
-        let event_heap = seed_events(&districts, &profiles, &mut seed_rng);
+        let escalation_cfg = EscalationConfig {
+            enabled:                  cfg.city.sim.queue_escalation_enabled.unwrap_or(false),
+            interval_min:             cfg.city.sim.queue_escalation_interval_min.unwrap_or(5),
+            c_to_b_min:               cfg.city.sim.escalation_c_to_b_min.unwrap_or(30),
+            b_to_a_min:               cfg.city.sim.escalation_b_to_a_min.unwrap_or(15),
+            cancellation_threshold:   cfg.city.sim.cancellation_threshold_min.unwrap_or(60),
+            cancellation_probability: cfg.city.sim.cancellation_probability.unwrap_or(0.15),
+        };
+
+        let mut event_heap = seed_events(&districts, &profiles, &mut seed_rng);
+
+        // Seed queue-escalation sweep events if enabled.
+        if escalation_cfg.enabled {
+            for district in &districts {
+                event_heap.push(Reverse(SimEvent::QueueEscalation {
+                    time:        SimTime(escalation_cfg.interval_min),
+                    district_id: district.id,
+                }));
+            }
+        }
 
         if let Some(parent) = Path::new(db_path).parent() {
             std::fs::create_dir_all(parent).expect("could not create output directory");
@@ -330,6 +352,7 @@ impl City {
             sim_type,
             mutual_aid_max_min: cfg.city.sim.mutual_aid_max_min.unwrap_or(8),
             mutual_aid_enabled: cfg.city.sim.mutual_aid_enabled.unwrap_or(false),
+            escalation_cfg,
         }
     }
 

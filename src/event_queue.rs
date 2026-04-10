@@ -14,6 +14,8 @@ pub enum SimEvent {
     PatrolLoop      { time: SimTime, unit_id: UnitId, district_id: DistrictId, dispatch_id: u32 },
     /// Periodic shift boundary — logs the change and schedules the next one.
     ShiftChange     { time: SimTime, district_id: DistrictId },
+    /// Periodic sweep: escalate long-waiting pending incidents and cancel stale ones.
+    QueueEscalation { time: SimTime, district_id: DistrictId },
     /// Sentinel for event handlers that have no follow-on simulation event.
     /// Filtered out in City::tick and never pushed to the heap.
     NoOp,
@@ -28,6 +30,7 @@ impl SimEvent {
             SimEvent::UnitReturn      { time, .. } => Some(*time),
             SimEvent::PatrolLoop      { time, .. } => Some(*time),
             SimEvent::ShiftChange     { time, .. } => Some(*time),
+            SimEvent::QueueEscalation { time, .. } => Some(*time),
             SimEvent::NoOp            => None,
         }
     }
@@ -40,6 +43,7 @@ impl SimEvent {
             SimEvent::UnitReturn      { district_id, .. } => Some(*district_id),
             SimEvent::PatrolLoop      { district_id, .. } => Some(*district_id),
             SimEvent::ShiftChange     { district_id, .. } => Some(*district_id),
+            SimEvent::QueueEscalation { district_id, .. } => Some(*district_id),
             SimEvent::NoOp            => None,
         }
     }

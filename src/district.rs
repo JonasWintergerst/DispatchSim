@@ -14,8 +14,8 @@ use crate::routing::RoutingEngine;
 use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
-    BorderNode, DistrictId, HexId, IncidentId, IncidentKind, IncidentStatus, MutualAidRequest,
-    NodeId, Priority, SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
+    BorderNode, DistrictId, EscalationConfig, HexId, IncidentId, IncidentKind, IncidentStatus,
+    MutualAidRequest, NodeId, Priority, SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
 
@@ -114,6 +114,7 @@ impl District {
         &mut self,
         batch: &[SimEvent],
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
+        esc_cfg: &EscalationConfig,
     ) -> ProcessOutput {
         let mut out = ProcessOutput { events: Vec::new(), aid_requests: Vec::new() };
 
@@ -136,6 +137,9 @@ impl District {
                 }
                 SimEvent::ShiftChange { time, .. } => {
                     self.handle_shift_change(*time, &mut out.events);
+                }
+                SimEvent::QueueEscalation { time, .. } => {
+                    self.handle_queue_escalation(*time, esc_cfg, &mut out);
                 }
                 SimEvent::NoOp => {}
             }
@@ -591,6 +595,119 @@ impl District {
             Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None },
             None,
         ));
+    }
+
+    fn handle_queue_escalation(
+        &mut self,
+        time:    SimTime,
+        esc_cfg: &EscalationConfig,
+        out:     &mut ProcessOutput,
+    ) {
+        // Schedule the next sweep.
+        out.events.push((
+            SimEvent::QueueEscalation {
+                time:        SimTime(time.0 + esc_cfg.interval_min),
+                district_id: self.id,
+            },
+            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None },
+            None,
+        ));
+
+        // Collect ids of open incidents that qualify for escalation or cancellation.
+        // We collect first to avoid borrowing `self.incidents` while mutating.
+        let mut to_escalate: Vec<(IncidentId, Priority)> = Vec::new();
+        let mut to_cancel:   Vec<IncidentId> = Vec::new();
+
+        for inc in self.incidents.values() {
+            if inc.status != IncidentStatus::Open { continue; }
+            let waited = time.0.saturating_sub(inc.spawned_at.0);
+
+            match inc.priority {
+                Priority::C => {
+                    // Cancellation check first (longer threshold).
+                    if waited >= esc_cfg.cancellation_threshold {
+                        let roll: f64 = self.rng.random();
+                        if roll < esc_cfg.cancellation_probability {
+                            to_cancel.push(inc.id.clone());
+                            continue;
+                        }
+                    }
+                    // Escalation C → B.
+                    if waited >= esc_cfg.c_to_b_min {
+                        to_escalate.push((inc.id.clone(), Priority::B));
+                    }
+                }
+                Priority::B => {
+                    if waited >= esc_cfg.b_to_a_min {
+                        to_escalate.push((inc.id.clone(), Priority::A));
+                    }
+                }
+                Priority::A => {} // already highest
+            }
+        }
+
+        // Apply cancellations.
+        for id in &to_cancel {
+            self.incidents.remove(id);
+            out.events.push((
+                SimEvent::NoOp,
+                Event {
+                    sim_time:      time.0,
+                    kind:          EventKind::IncidentCancelled,
+                    district:      self.id,
+                    unit:          None,
+                    incident:      Some(id.clone()),
+                    priority:      None,
+                    incident_kind: None,
+                },
+                None,
+            ));
+        }
+
+        // Apply escalations — bump priority and re-insert into the pending queue
+        // with the new rank. The old entry (lower rank) will be skipped by
+        // pop_best_pending because the incident will already be Assigned or gone.
+        for (id, new_priority) in &to_escalate {
+            if let Some(inc) = self.incidents.get_mut(id) {
+                let old_pri = priority_str(inc.priority);
+                let new_pri = priority_str(*new_priority);
+                inc.priority = *new_priority;
+                self.pending_queue.push(PendingIncident {
+                    rank: new_priority.rank(),
+                    id:   id.clone(),
+                });
+                out.events.push((
+                    SimEvent::NoOp,
+                    Event {
+                        sim_time:      time.0,
+                        kind:          EventKind::IncidentEscalated,
+                        district:      self.id,
+                        unit:          None,
+                        incident:      Some(id.clone()),
+                        priority:      Some(format!("{}→{}", old_pri, new_pri)),
+                        incident_kind: None,
+                    },
+                    None,
+                ));
+            }
+        }
+
+        // After escalation, try to dispatch from the (now-reprioritised) pending
+        // queue — the escalated incident may now preempt a lower-priority dispatch.
+        if !to_escalate.is_empty() {
+            if let Some(pending_id) = self.pop_best_pending() {
+                let dispatched = self.try_dispatch_pending(
+                    pending_id.clone(), time, &mut out.events, false,
+                );
+                if !dispatched {
+                    // Put it back; re-push with current rank.
+                    let rank = self.incidents.get(&pending_id)
+                        .map(|i| i.priority.rank())
+                        .unwrap_or(0);
+                    self.pending_queue.push(PendingIncident { rank, id: pending_id });
+                }
+            }
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────

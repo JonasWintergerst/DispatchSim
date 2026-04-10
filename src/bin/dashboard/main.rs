@@ -6,6 +6,7 @@ mod map_tab;
 mod palette;
 mod process;
 mod reports_tab;
+mod tiles;
 mod whatif_tab;
 
 use data::{HexEntry, StationEntry};
@@ -20,6 +21,13 @@ enum ActiveTab {
     Map,
     Reports,
     WhatIf,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum HexOverlay {
+    Filled,
+    Borders,
+    Hidden,
 }
 
 // ── App state ────────────────────────────────────────────────────────────────
@@ -38,6 +46,12 @@ struct DashboardApp {
     /// against whatever the simulator already flushed to the SQLite DB.
     stop_requested: bool,
     report_text: Option<String>,
+
+    // ── Map + hex overlay ────────────────────────────────────────────────
+    show_map: bool,
+    hex_overlay: HexOverlay,
+    tile_map: Option<tiles::TileMap>,
+    map_texture: Option<egui::TextureHandle>,
 
     // ── Isochrone overlay ─────────────────────────────────────────────────
     /// Minimum haversine travel time in minutes to nearest station, one per hex.
@@ -85,6 +99,9 @@ impl DashboardApp {
             .iter()
             .map(|h| data::min_travel_min(h.lat, h.lon, &district_stations))
             .collect();
+        let tile_map = tiles::fetch_tile_map(
+            lat_range.0, lat_range.1, lon_range.0, lon_range.1,
+        );
         let baseline_alloc = data::load_district_allocations();
         let current_alloc = baseline_alloc.clone();
         Self {
@@ -98,6 +115,10 @@ impl DashboardApp {
             process: None,
             stop_requested: false,
             report_text: None,
+            show_map: tile_map.is_some(),
+            hex_overlay: HexOverlay::Filled,
+            tile_map,
+            map_texture: None,
             isochrone_minutes,
             show_isochrones: false,
             active_tab: ActiveTab::Map,
@@ -318,6 +339,22 @@ impl eframe::App for DashboardApp {
                 });
                 if ui.button("📋 Report").clicked() { self.run_report(); }
 
+                ui.separator();
+                if self.tile_map.is_some() {
+                    ui.toggle_value(&mut self.show_map, "🗺 Map");
+                }
+                egui::ComboBox::from_id_salt("hex_overlay")
+                    .selected_text(match self.hex_overlay {
+                        HexOverlay::Filled  => "Filled",
+                        HexOverlay::Borders => "Borders",
+                        HexOverlay::Hidden  => "Hidden",
+                    })
+                    .width(70.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.hex_overlay, HexOverlay::Filled,  "Filled");
+                        ui.selectable_value(&mut self.hex_overlay, HexOverlay::Borders, "Borders");
+                        ui.selectable_value(&mut self.hex_overlay, HexOverlay::Hidden,  "Hidden");
+                    });
                 ui.separator();
                 ui.toggle_value(&mut self.show_isochrones, "🌐 Isochrones");
                 ui.separator();

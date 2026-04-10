@@ -54,11 +54,24 @@ fn print_overview(conn: &Connection) -> Result<()> {
     println!("  Duration:      {:>12} min  ({:.2} yr)", fmt_int(duration_min), duration_yr);
     println!("  Events logged: {:>12}", fmt_int(total_events));
 
-    let open    = spawned - resolved;
+    let escalated: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'IncidentEscalated'",
+        [], |r| r.get(0),
+    )?;
+
+    let cancelled: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE kind = 'IncidentCancelled'",
+        [], |r| r.get(0),
+    )?;
+
+    let open    = spawned - resolved - cancelled;
     let open_pct = if spawned > 0 { open as f64 / spawned as f64 * 100.0 } else { 0.0 };
+    let cancel_pct = if spawned > 0 { cancelled as f64 / spawned as f64 * 100.0 } else { 0.0 };
     println!("\nIncidents");
     println!("  Spawned:       {:>12}", fmt_int(spawned));
     println!("  Resolved:      {:>12}", fmt_int(resolved));
+    println!("  Escalated:     {:>12}", fmt_int(escalated));
+    println!("  Cancelled:     {:>12}  ({:.1}% self-resolved)", fmt_int(cancelled), cancel_pct);
     println!("  Open / queued: {:>12}  ({:.1}% unresolved)", fmt_int(open), open_pct);
 
     Ok(())
