@@ -21,7 +21,7 @@ use crate::spawner::SpawnProfile;
 use crate::station::Station;
 use crate::types::{
     BorderNode, DistrictId, EscalationConfig, HexId, IncidentKind, MutualAidRequest, NodeId,
-    SimType, SpawnProfileId, StationId, UnitId, UnitStatus,
+    ServiceTimeConfig, SimType, SpawnProfileId, StationId, UnitId, UnitStatus,
 };
 use crate::unit::Unit;
 
@@ -47,6 +47,8 @@ pub struct City {
     mutual_aid_enabled:  bool,
     /// Queue escalation config, stored centrally and passed to districts.
     pub escalation_cfg:  EscalationConfig,
+    /// On-scene service-time distribution per priority, passed to districts.
+    pub service_time_cfg: ServiceTimeConfig,
 }
 
 impl City {
@@ -80,7 +82,7 @@ impl City {
         for d in self.districts.iter_mut() {
             if !district_batches.contains_key(&d.id) { continue; }
             let batch = district_batches.get(&d.id).map(Vec::as_slice).unwrap_or(&[]);
-            let mut out = d.process_events(batch, profiles, &self.escalation_cfg);
+            let mut out = d.process_events(batch, profiles, &self.escalation_cfg, &self.service_time_cfg);
             follow_on.append(&mut out.events);
             all_aid.append(&mut out.aid_requests);
         }
@@ -344,6 +346,11 @@ impl City {
             cancellation_probability: cfg.city.sim.cancellation_probability.unwrap_or(0.15),
         };
 
+        let service_time_cfg = cfg.city.service_time
+            .clone()
+            .map(|raw| raw.into_config())
+            .unwrap_or_else(ServiceTimeConfig::default_uniform);
+
         let mut event_heap = seed_events(&districts, &profiles, &mut seed_rng);
 
         // Seed queue-escalation sweep events if enabled.
@@ -374,6 +381,7 @@ impl City {
             mutual_aid_max_min: cfg.city.sim.mutual_aid_max_min.unwrap_or(8),
             mutual_aid_enabled: cfg.city.sim.mutual_aid_enabled.unwrap_or(false),
             escalation_cfg,
+            service_time_cfg,
         }
     }
 

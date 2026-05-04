@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::SimType;
+use crate::types::{ServiceTimeConfig, ServiceTimeDist, SimType};
 
 // ---------------------------------------------------------------------------
 // Top-level entry point
@@ -63,6 +63,58 @@ pub struct CityConfig {
     /// stations between calls (the pre-Phase-2 behaviour).
     #[serde(default)]
     pub patrol: Option<PatrolConfig>,
+
+    /// Optional on-scene service-time distribution overrides. Absent → the
+    /// Larson/Chaiken uniform defaults (45–90 / 25–55 / 15–35 minutes).
+    #[serde(default)]
+    pub service_time: Option<ServiceTimeRaw>,
+}
+
+// ---------------------------------------------------------------------------
+// Service-time config (TOML-facing mirror of types::ServiceTimeConfig)
+// ---------------------------------------------------------------------------
+
+/// TOML section `[service_time]`. Each priority accepts one of the
+/// `ServiceTimeDistRaw` variants via an internally-tagged enum — e.g.
+/// `a = { kind = "lognormal", mu = 4.16, sigma = 0.35 }`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ServiceTimeRaw {
+    pub a: Option<ServiceTimeDistRaw>,
+    pub b: Option<ServiceTimeDistRaw>,
+    pub c: Option<ServiceTimeDistRaw>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ServiceTimeDistRaw {
+    Uniform     { min: u64, max: u64 },
+    Lognormal   { mu: f64, sigma: f64 },
+    Exponential { mean: f64 },
+}
+
+impl From<ServiceTimeDistRaw> for ServiceTimeDist {
+    fn from(raw: ServiceTimeDistRaw) -> Self {
+        match raw {
+            ServiceTimeDistRaw::Uniform { min, max } =>
+                ServiceTimeDist::Uniform { min, max },
+            ServiceTimeDistRaw::Lognormal { mu, sigma } =>
+                ServiceTimeDist::Lognormal { mu, sigma },
+            ServiceTimeDistRaw::Exponential { mean } =>
+                ServiceTimeDist::Exponential { mean },
+        }
+    }
+}
+
+impl ServiceTimeRaw {
+    /// Merge raw overrides with the Larson/Chaiken uniform defaults: any
+    /// priority absent from the TOML keeps its default distribution.
+    pub fn into_config(self) -> ServiceTimeConfig {
+        let mut cfg = ServiceTimeConfig::default_uniform();
+        if let Some(a) = self.a { cfg.a = a.into(); }
+        if let Some(b) = self.b { cfg.b = b.into(); }
+        if let Some(c) = self.c { cfg.c = c.into(); }
+        cfg
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

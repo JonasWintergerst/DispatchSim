@@ -1,3 +1,4 @@
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 use crate::hex::HexCoord;
@@ -164,6 +165,67 @@ pub struct EscalationConfig {
     pub b_to_a_min:               u64,
     pub cancellation_threshold:   u64,
     pub cancellation_probability: f64,
+}
+
+/// On-scene service-time distribution for a single priority class. Params are
+/// raw (Copy) so the enclosing `ServiceTimeConfig` stays cheap to pass; the
+/// actual distribution object is rebuilt at each sample call.
+#[derive(Clone, Copy, Debug)]
+pub enum ServiceTimeDist {
+    /// `rng.random_range(min..=max)` — current default, Larson/Chaiken-style.
+    Uniform     { min: u64, max: u64 },
+    /// Lognormal with log-space mean `mu` and log-space std `sigma`.
+    /// Real-space median = exp(mu), mean = exp(mu + sigma²/2).
+    Lognormal   { mu: f64, sigma: f64 },
+    /// Exponential with mean duration `mean` (minutes). Memoryless baseline.
+    Exponential { mean: f64 },
+}
+
+impl ServiceTimeDist {
+    /// Sample an on-scene duration in whole minutes. Always >= 1 min.
+    pub fn sample(&self, rng: &mut impl rand::Rng) -> u64 {
+        use rand_distr::{Distribution, LogNormal, Exp};
+        match *self {
+            ServiceTimeDist::Uniform { min, max } => rng.random_range(min..=max),
+            ServiceTimeDist::Lognormal { mu, sigma } => {
+                let d = LogNormal::new(mu, sigma)
+                    .expect("lognormal params must be finite and sigma > 0");
+                d.sample(rng).round().max(1.0) as u64
+            }
+            ServiceTimeDist::Exponential { mean } => {
+                let d = Exp::new(1.0 / mean).expect("exponential mean must be > 0");
+                d.sample(rng).round().max(1.0) as u64
+            }
+        }
+    }
+}
+
+/// Per-priority on-scene service-time distribution. Passed to districts so
+/// `handle_arrival` can sample the right distribution for each incident.
+#[derive(Clone, Copy, Debug)]
+pub struct ServiceTimeConfig {
+    pub a: ServiceTimeDist,
+    pub b: ServiceTimeDist,
+    pub c: ServiceTimeDist,
+}
+
+impl ServiceTimeConfig {
+    /// Larson (1972) / Chaiken (1978) ranges — matches the pre-Phase-3 defaults.
+    pub fn default_uniform() -> Self {
+        Self {
+            a: ServiceTimeDist::Uniform { min: 45, max: 90 },
+            b: ServiceTimeDist::Uniform { min: 25, max: 55 },
+            c: ServiceTimeDist::Uniform { min: 15, max: 35 },
+        }
+    }
+
+    pub fn sample(&self, priority: Priority, rng: &mut impl rand::Rng) -> u64 {
+        match priority {
+            Priority::A => self.a.sample(rng),
+            Priority::B => self.b.sample(rng),
+            Priority::C => self.c.sample(rng),
+        }
+    }
 }
 
 /// A request from one district that has no available local unit. Emitted by

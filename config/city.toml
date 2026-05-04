@@ -61,6 +61,25 @@ cancellation_probability   = 0.15
 [patrol]
 routes_path = "config/patrol_routes_hotspot.json"
 
+# ---------------------------------------------------------------------------
+# On-scene service-time distribution per priority.
+#
+# Optional; omitting this section keeps the Larson/Chaiken uniform defaults
+# (45–90 / 25–55 / 15–35 minutes). Each priority accepts exactly one of:
+#   kind = "uniform",     min = <u64>,  max = <u64>
+#   kind = "lognormal",   mu  = <f64>,  sigma = <f64>   (log-space params)
+#   kind = "exponential", mean = <f64>                  (mean in minutes)
+#
+# Lognormal parameters: median = exp(mu), mean = exp(mu + sigma²/2).
+# The defaults below roughly reproduce the uniform means (70 / 40 / 25 min)
+# but with a realistic right tail; source: AEDR empirical on-scene durations.
+# ---------------------------------------------------------------------------
+
+# [service_time]
+# a = { kind = "lognormal", mu = 4.16, sigma = 0.35 }   # median ≈ 64, mean ≈ 68
+# b = { kind = "lognormal", mu = 3.58, sigma = 0.40 }   # median ≈ 36, mean ≈ 39
+# c = { kind = "lognormal", mu = 3.10, sigma = 0.45 }   # median ≈ 22, mean ≈ 25
+
 # Maps the abstract (col, row) hex grid onto Hamburg's geographic footprint.
 # row 0 = north (lat_max), row N = south (lat_min).
 # col 0 = west  (lon_min), col N = east  (lon_max).

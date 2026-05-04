@@ -15,7 +15,8 @@ use crate::spawner::{SpawnProfile, next_spawn_time};
 use crate::station::Station;
 use crate::types::{
     BorderNode, DistrictId, EscalationConfig, HexId, IncidentId, IncidentKind, IncidentStatus,
-    MutualAidRequest, NodeId, Priority, SpawnProfileId, UnitId, UnitRequirements, UnitStatus,
+    MutualAidRequest, NodeId, Priority, ServiceTimeConfig, SpawnProfileId, UnitId,
+    UnitRequirements, UnitStatus,
 };
 use crate::unit::Unit;
 
@@ -115,6 +116,7 @@ impl District {
         batch: &[SimEvent],
         profiles: &HashMap<SpawnProfileId, SpawnProfile>,
         esc_cfg: &EscalationConfig,
+        svc_cfg: &ServiceTimeConfig,
     ) -> ProcessOutput {
         let mut out = ProcessOutput { events: Vec::new(), aid_requests: Vec::new() };
 
@@ -124,7 +126,7 @@ impl District {
                     self.handle_spawn(*time, *hex_id, profiles, &mut out);
                 }
                 SimEvent::UnitArrival { time, unit_id, incident_id, dispatch_id, .. } => {
-                    self.handle_arrival(*time, *unit_id, incident_id, *dispatch_id, &mut out.events);
+                    self.handle_arrival(*time, *unit_id, incident_id, *dispatch_id, svc_cfg, &mut out.events);
                 }
                 SimEvent::IncidentResolve { time, incident_id, .. } => {
                     self.handle_resolve(*time, incident_id, &mut out.events);
@@ -344,6 +346,7 @@ impl District {
         unit_id: UnitId,
         incident_id: &IncidentId,
         dispatch_id: u32,
+        svc_cfg: &ServiceTimeConfig,
         out: &mut Out,
     ) {
         let Some(idx) = self.units.iter().position(|u| u.id == unit_id) else { return; };
@@ -359,15 +362,13 @@ impl District {
             None      => self.units[idx].status = UnitStatus::OnScene,
         }
 
-        // On-scene duration by priority — Larson (1972), Chaiken (1978):
-        //   P1 (immediate): mean ≈ 70 min  →  Uniform(45, 90)
-        //   P2 (urgent):    mean ≈ 40 min  →  Uniform(25, 55)
-        //   P3 (routine):   mean ≈ 25 min  →  Uniform(15, 35)
-        let resolve_duration = match priority {
-            Some(Priority::A) => self.rng.random_range(45u64..=90),
-            Some(Priority::B) => self.rng.random_range(25u64..=55),
-            _                 => self.rng.random_range(15u64..=35),
-        };
+        // On-scene duration by priority. Distribution is configurable per
+        // priority via [service_time] in city.toml; defaults are the
+        // Larson/Chaiken uniform ranges (45–90 / 25–55 / 15–35 min).
+        let resolve_duration = svc_cfg.sample(
+            priority.unwrap_or(Priority::C),
+            &mut self.rng,
+        );
         let resolve_time     = SimTime(time.0 + resolve_duration);
 
         out.push((
