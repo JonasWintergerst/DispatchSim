@@ -4,7 +4,10 @@
       "Bash(cargo build:*)",
       "Bash(cargo test:*)",
       "Bash(cargo run:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cargo clippy *)",
+      "WebSearch",
+      "Bash(cargo check *)"
     ]
   }
 }
