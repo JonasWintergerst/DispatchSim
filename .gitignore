@@ -3,4 +3,12 @@ output/
 hamburg-260331.osm.pbf
 hamburg-latest.osm.pbf
 config/
-thesis/
+
+# LaTeX build artefacts (track sources + .pdf, not intermediates)
+thesis/*.aux
+thesis/*.log
+thesis/*.out
+thesis/*.toc
+thesis/*.fls
+thesis/*.fdb_latexmk
+thesis/*.synctex.gz
