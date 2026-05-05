@@ -837,3 +837,174 @@ fn kind_str(k: IncidentKind) -> String {
         IncidentKind::Accident         => "Accident".into(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    use crate::hex::HexCoord;
+    use crate::types::{HexId, SimType, StationId};
+
+    /// Build a minimal District for dispatch-logic tests: 3×3 hex grid,
+    /// single station at (0,0), `num_units` Idle units homed there, no patrol.
+    fn test_district(num_units: u32) -> District {
+        let coords: Vec<(NodeId, HexCoord)> = (0..3)
+            .flat_map(|c| (0..3).map(move |r| {
+                let coord = HexCoord::new(c, r);
+                (NodeId::from_hex(&coord), coord)
+            }))
+            .collect();
+        let routing = Arc::new(RoutingEngine::from_hex_grid(&coords));
+        let station_node = NodeId::from_hex(&HexCoord::new(0, 0));
+        let district_id  = DistrictId::new(1);
+
+        let units: Vec<Unit> = (0..num_units)
+            .map(|i| Unit::new(UnitId::new(i), SimType::Police, station_node))
+            .collect();
+        let unit_ids: Vec<UnitId> = units.iter().map(|u| u.id).collect();
+        let station = Station::new(
+            StationId::new(1), "test".into(), SimType::Police, station_node, unit_ids,
+        );
+        let hexes: Vec<Hex> = coords.iter().enumerate().map(|(i, (nid, _))| Hex {
+            id:               HexId::new(i as u32),
+            h3_index:         i as u64,
+            lat:              0.0,
+            lon:              0.0,
+            district:         district_id,
+            spawn_profile_id: SpawnProfileId::new("default".into()),
+            road_nodes:       vec![*nid],
+        }).collect();
+
+        District::new(
+            district_id,
+            station,
+            units,
+            hexes,
+            SmallRng::seed_from_u64(0),
+            routing,
+            false,
+        )
+    }
+
+    fn insert_incident(d: &mut District, id: &str, priority: Priority, loc: NodeId, t: SimTime) {
+        d.incidents.insert(
+            IncidentId::new(id.into()),
+            Incident::new(
+                IncidentId::new(id.into()),
+                IncidentKind::Crime,
+                priority,
+                loc,
+                d.id,
+                UnitRequirements(1),
+                t,
+            ),
+        );
+    }
+
+    /// A UnitArrival carrying a stale dispatch_id (older than the unit's
+    /// current value) must be discarded — the unit was redispatched after the
+    /// event was scheduled, so honouring it would yank the unit from its real
+    /// assignment. This is the core invariant of the `dispatch_id` pattern.
+    #[test]
+    fn stale_unit_arrival_is_discarded() {
+        let mut d = test_district(1);
+        let unit_id = d.units[0].id;
+        let loc = NodeId::from_hex(&HexCoord::new(2, 2));
+
+        // Two dispatches → unit's dispatch_id is now 2; an arrival with did=1 is stale.
+        let _did1 = d.units[0].dispatch(SimTime(0), SimTime(2), IncidentId::new("inc-1".into()));
+        let did2  = d.units[0].dispatch(SimTime(1), SimTime(3), IncidentId::new("inc-2".into()));
+        assert_eq!(did2, 2, "second dispatch should bump dispatch_id to 2");
+
+        insert_incident(&mut d, "inc-2", Priority::B, loc, SimTime(1));
+
+        let stale = SimEvent::UnitArrival {
+            time: SimTime(2),
+            unit_id,
+            incident_id: IncidentId::new("inc-2".into()),
+            district_id: d.id,
+            dispatch_id: 1,
+        };
+        let svc = ServiceTimeConfig::default_uniform();
+        let esc = EscalationConfig {
+            enabled: false, interval_min: 5, c_to_b_min: 30, b_to_a_min: 15,
+            cancellation_threshold: 60, cancellation_probability: 0.0,
+        };
+        let profiles: HashMap<SpawnProfileId, SpawnProfile> = HashMap::new();
+        let out = d.process_events(&[stale], &profiles, &esc, &svc);
+
+        assert_eq!(d.units[0].status, UnitStatus::Dispatched,
+            "stale arrival must not flip unit to OnScene");
+        assert!(
+            out.events.iter().all(|(ev, _, _)| !matches!(ev, SimEvent::IncidentResolve { .. })),
+            "stale arrival must not schedule an IncidentResolve",
+        );
+    }
+
+    /// Preemption: when the only unit is dispatched to a low-priority call and
+    /// a higher-priority incident arrives, the unit is redirected and the old
+    /// incident returns to the pending queue.
+    #[test]
+    fn higher_priority_preempts_dispatched_unit() {
+        let mut d = test_district(1);
+        let loc_c = NodeId::from_hex(&HexCoord::new(1, 1));
+        let loc_a = NodeId::from_hex(&HexCoord::new(2, 2));
+
+        // Step 1: dispatch the lone unit to a Priority C call.
+        insert_incident(&mut d, "inc-c", Priority::C, loc_c, SimTime(0));
+        let mut out: Out = Vec::new();
+        let dispatched_c = d.try_dispatch_pending(
+            IncidentId::new("inc-c".into()), SimTime(0), &mut out, false,
+        );
+        assert!(dispatched_c, "first dispatch (C) should succeed against an idle unit");
+        assert_eq!(d.units[0].status, UnitStatus::Dispatched);
+        assert_eq!(d.units[0].assigned_incident.as_ref().map(|i| i.value()), Some("inc-c"));
+
+        // Step 2: Priority A call arrives. No idle/patrolling/returning unit
+        // exists → must preempt the C dispatch.
+        insert_incident(&mut d, "inc-a", Priority::A, loc_a, SimTime(1));
+        let dispatched_a = d.try_dispatch_pending(
+            IncidentId::new("inc-a".into()), SimTime(1), &mut out, false,
+        );
+        assert!(dispatched_a, "Priority A must preempt the only unit");
+        assert_eq!(d.units[0].assigned_incident.as_ref().map(|i| i.value()), Some("inc-a"));
+
+        // Step 3: the preempted C call should be back in the pending queue.
+        let popped = d.pop_best_pending();
+        assert_eq!(popped.as_ref().map(|i| i.value()), Some("inc-c"),
+            "preempted incident must be re-queued");
+    }
+
+    /// Mutual aid acceptance: a lender district with an idle unit accepts a
+    /// foreign request, dispatches its unit, and tags it with `loaned_to` so
+    /// the resolve handler routes the synthetic cleanup back to the requester.
+    #[test]
+    fn mutual_aid_loan_dispatches_and_tags_unit() {
+        let mut lender = test_district(1);
+        let requester  = DistrictId::new(99);
+        let foreign_loc = NodeId::from_hex(&HexCoord::new(2, 2));
+
+        let req = MutualAidRequest {
+            requesting_district: requester,
+            incident_id:         IncidentId::new("foreign-1".into()),
+            location:            foreign_loc,
+            priority:            Priority::A,
+            spawn_time:          SimTime(0),
+        };
+
+        let mut out: Out = Vec::new();
+        let success = lender.try_accept_loan(SimTime(0), requester, &req, &mut out);
+        assert!(success, "lender with an idle unit must accept the loan");
+
+        let u = &lender.units[0];
+        assert_eq!(u.status, UnitStatus::Dispatched);
+        assert_eq!(u.assigned_incident.as_ref().map(|i| i.value()), Some("foreign-1"));
+        assert_eq!(u.loaned_to, Some(requester),
+            "lender unit must remember which district it was loaned to");
+    }
+}

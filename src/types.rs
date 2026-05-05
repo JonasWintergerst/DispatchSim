@@ -27,7 +27,7 @@ pub enum SimType {
     Ambulance,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnitStatus {
     Idle,
     Dispatched,
