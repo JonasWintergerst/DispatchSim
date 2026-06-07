@@ -12,3 +12,9 @@ thesis/*.toc
 thesis/*.fls
 thesis/*.fdb_latexmk
 thesis/*.synctex.gz
+thesis/*.bcf
+thesis/*.blg
+thesis/*.run.xml
+thesis/*.lof
+thesis/*.lot
+thesis/*.bbl
