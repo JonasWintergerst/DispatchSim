@@ -32,9 +32,9 @@ pub fn print_report(db_path: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Show how each `travel_time` query was answered: the precomputed anchor↔anchor
-/// matrix, exact A* (computed/cached), or haversine fallback. This makes the
-/// routing model observable — a healthy run is ~100% matrix with ~0 haversine,
-/// since every dispatch endpoint is a hex anchor.
+/// matrix, or a haversine fallback for disconnected pairs. This makes the routing
+/// model observable — a healthy run is ~100% matrix with ~0 haversine, since
+/// every dispatch endpoint is a hex anchor.
 fn print_routing_resolution(conn: &Connection) -> Result<()> {
     // The table is absent on DBs created before this instrumentation existed.
     let table_exists: i64 = conn.query_row(
@@ -63,21 +63,16 @@ fn print_routing_resolution(conn: &Connection) -> Result<()> {
     }
     let pct = |x: i64| x as f64 / total as f64 * 100.0;
 
-    // `rev` (the old symmetry-reverse tier) is always 0 with the full matrix;
-    // fold it into the matrix total so older DBs still sum correctly.
-    let matrix = fwd + rev;
+    // Everything that isn't a haversine fallback is a matrix hit. The old A*
+    // tiers (exact_computed/exact_cached) and the symmetry-reverse row no longer
+    // exist in the matrix-only engine and are always 0, so they fold into matrix.
+    let matrix = fwd + rev + exact + cached;
     println!("\nTravel-Time Resolution  (how each routing query was answered)");
     println!("  {:<36} {:>14} {:>8}", "Tier", "N", "%");
     println!("  {:<36} {:>14} {:>7.1}%", "Precomputed matrix",               fmt_int(matrix), pct(matrix));
-    println!("  {:<36} {:>14} {:>7.1}%", "Exact A* (computed)",               fmt_int(exact),  pct(exact));
-    println!("  {:<36} {:>14} {:>7.1}%", "Exact A* (cached)",                 fmt_int(cached), pct(cached));
     println!("  {:<36} {:>14} {:>7.1}%", "Haversine fallback (disconnected)", fmt_int(hav),    pct(hav));
     println!("  {:<36} {:>14}", "Total", fmt_int(total));
 
-    println!(
-        "\n  Matrix: {:.1}%   Exact A*: {:.1}%   Haversine: {:.2}%",
-        pct(matrix), pct(exact + cached), pct(hav),
-    );
     if hav > 0 {
         println!("  ⚠ {} queries hit the haversine estimate (disconnected node pairs).", fmt_int(hav));
     }
