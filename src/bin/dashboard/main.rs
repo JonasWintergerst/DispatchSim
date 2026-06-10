@@ -76,6 +76,8 @@ struct DashboardApp {
     whatif_raw_output: Option<String>,
     whatif_running: bool,
     whatif_progress: String,
+    /// Per-variant live progress bars (index = variant index).
+    whatif_variant_progress: Vec<whatif_tab::VariantProgress>,
     whatif_captured_output: String,
     whatif_delta: u32,
     whatif_max_variants: usize,
@@ -134,6 +136,7 @@ impl DashboardApp {
             whatif_raw_output: None,
             whatif_running: false,
             whatif_progress: String::new(),
+            whatif_variant_progress: Vec::new(),
             whatif_captured_output: String::new(),
             whatif_delta: 2,
             whatif_max_variants: 10,

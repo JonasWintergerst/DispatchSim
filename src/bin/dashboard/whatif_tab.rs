@@ -8,6 +8,19 @@ use crate::process::{spawn_with_live_stdout, ProcessKind};
 // Data types
 // ---------------------------------------------------------------------------
 
+/// Live progress for a single variant, parsed from the `SimBatch` stdout
+/// lines (`[ i/n] name  sim X%` / `… done — SLA overall: Y%`).
+#[derive(Clone, Default)]
+pub struct VariantProgress {
+    pub name: String,
+    /// 0..100; reaches 100 when the variant finishes.
+    pub pct: f32,
+    pub done: bool,
+    pub failed: bool,
+    /// Overall SLA % once the variant is done.
+    pub sla: Option<f32>,
+}
+
 /// A named variant: per-district unit allocation.
 #[derive(Clone)]
 pub struct WhatIfVariant {
@@ -133,9 +146,29 @@ impl DashboardApp {
                 ui.add(egui::DragValue::new(&mut self.whatif_max_variants).range(2..=50).speed(0.5));
             });
 
-            // Sim duration override
+            // Sim duration — presets plus an optional custom override. Applies
+            // to both the reallocation what-if and the patrol comparison.
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.whatif_short_sim, "Shorten sim to");
+                ui.label("Sim duration:");
+                // (label, minutes): 30 days, 1 year (365d), 4 years.
+                let presets: [(&str, u64); 3] = [
+                    ("30 days", 43_200),
+                    ("1 year", 525_600),
+                    ("4 years", 2_102_400),
+                ];
+                for (label, mins) in presets {
+                    let active = self.whatif_short_sim && self.whatif_sim_duration == mins;
+                    if ui.selectable_label(active, label).clicked() {
+                        self.whatif_short_sim = true;
+                        self.whatif_sim_duration = mins;
+                    }
+                }
+                if ui.selectable_label(!self.whatif_short_sim, "config default").clicked() {
+                    self.whatif_short_sim = false;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.whatif_short_sim, "Custom:");
                 ui.add_enabled(
                     self.whatif_short_sim,
                     egui::DragValue::new(&mut self.whatif_sim_duration)
@@ -143,8 +176,8 @@ impl DashboardApp {
                         .speed(1440.0)
                         .suffix(" min"),
                 );
-                let days = self.whatif_sim_duration as f64 / 1440.0;
                 if self.whatif_short_sim {
+                    let days = self.whatif_sim_duration as f64 / 1440.0;
                     ui.weak(format!("({days:.0} days)"));
                 }
             });
@@ -199,13 +232,21 @@ impl DashboardApp {
 
                     ui.add_space(4.0);
                     let any_selected = self.whatif_patrol_strategies.iter().any(|(_, _, e)| *e);
-                    ui.add_enabled_ui(!busy && any_selected, |ui| {
-                        if ui.button("Run Patrol Comparison").clicked() {
+                    // Runnable with no strategy ticked too: that yields the
+                    // standard reference vs. mutual-aid-only comparison.
+                    let can_run = any_selected || self.whatif_mutual_aid;
+                    ui.add_enabled_ui(!busy && can_run, |ui| {
+                        let label = if any_selected {
+                            "Run Patrol Comparison"
+                        } else {
+                            "Run Standard vs. Mutual-Aid"
+                        };
+                        if ui.button(label).clicked() {
                             self.spawn_whatif_patrol();
                         }
                     });
-                    if !any_selected && !self.whatif_patrol_strategies.is_empty() {
-                        ui.weak("Tick at least one strategy to enable.");
+                    if !can_run {
+                        ui.weak("Tick a strategy or enable mutual-aid variants to run.");
                     }
                 });
 
@@ -220,6 +261,39 @@ impl DashboardApp {
                             .color(Color32::from_rgb(180, 220, 255)),
                     );
                 });
+
+                // Per-variant percent
+                if !self.whatif_variant_progress.is_empty() {
+                    ui.add_space(2.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for (i, vp) in self.whatif_variant_progress.iter().enumerate() {
+                                let name = if vp.name.is_empty() {
+                                    format!("#{}", i + 1)
+                                } else {
+                                    vp.name.clone()
+                                };
+                                let (status, color) = if vp.failed {
+                                    ("FAILED".to_string(), Color32::from_rgb(220, 80, 80))
+                                } else if vp.done {
+                                    let s = match vp.sla {
+                                        Some(s) => format!("done — SLA {s:.1}%"),
+                                        None => "done".to_string(),
+                                    };
+                                    (s, Color32::from_rgb(120, 200, 140))
+                                } else {
+                                    (format!("{:.0}%", vp.pct), Color32::from_rgb(180, 220, 255))
+                                };
+                                ui.label(
+                                    RichText::new(format!("{name:<34} {status}"))
+                                        .monospace()
+                                        .color(color),
+                                );
+                            }
+                        });
+                }
             }
 
             // Results
@@ -315,6 +389,7 @@ impl DashboardApp {
                 self.whatif_running = true;
                 self.whatif_progress = "Starting…".into();
                 self.whatif_results.clear();
+                self.whatif_variant_progress.clear();
                 self.whatif_raw_output = None;
                 self.whatif_captured_output.clear();
             }
@@ -341,11 +416,18 @@ impl DashboardApp {
             "whatif-patrol".into(),
             "config/city.toml".into(),
         ];
+        let mut any_strategy = false;
         for (label, _path, enabled) in &self.whatif_patrol_strategies {
             if *enabled {
                 args.push("--strategy".into());
                 args.push(label.clone());
+                any_strategy = true;
             }
+        }
+        // No strategy ticked → compare the standard reference against
+        // mutual-aid-only (skip patrol route discovery entirely).
+        if !any_strategy {
+            args.push("--no-patrol".into());
         }
         if !self.whatif_mutual_aid {
             args.push("--no-aid".into());
@@ -363,6 +445,7 @@ impl DashboardApp {
                 self.whatif_running = true;
                 self.whatif_progress = "Starting…".into();
                 self.whatif_results.clear();
+                self.whatif_variant_progress.clear();
                 self.whatif_raw_output = None;
                 self.whatif_captured_output.clear();
             }
@@ -398,7 +481,24 @@ impl DashboardApp {
         self.whatif_captured_output.push_str(line);
         self.whatif_captured_output.push('\n');
 
-        // Update progress display
+        // Per-variant progress bars: `[ i/n] name  sim X%` / `… done — SLA …`.
+        if let Some(p) = parse_variant_progress(line) {
+            if self.whatif_variant_progress.len() < p.index_count {
+                self.whatif_variant_progress
+                    .resize(p.index_count, VariantProgress::default());
+            }
+            if let Some(slot) = self.whatif_variant_progress.get_mut(p.index) {
+                slot.name = p.name;
+                slot.pct = p.pct;
+                slot.done = p.done;
+                slot.failed = p.failed;
+                if p.sla.is_some() {
+                    slot.sla = p.sla;
+                }
+            }
+        }
+
+        // Update headline progress display
         if line.contains("…") || line.contains("...") || line.contains("done") {
             self.whatif_progress = line.trim().to_string();
         }
@@ -411,6 +511,7 @@ impl DashboardApp {
     pub fn finalize_whatif(&mut self) {
         self.whatif_running = false;
         self.whatif_progress.clear();
+        self.whatif_variant_progress.clear();
         self.whatif_raw_output = Some(self.whatif_captured_output.clone());
         self.whatif_results = parse_whatif_output(&self.whatif_captured_output);
         self.whatif_captured_output.clear();
@@ -428,6 +529,60 @@ fn sla_color(pct: f64) -> Color32 {
         Color32::from_rgb(220, 200, 80)
     } else {
         Color32::from_rgb(220, 80, 80)
+    }
+}
+
+/// One parsed per-variant progress update.
+struct ParsedProgress {
+    index: usize,       // 0-based variant index
+    index_count: usize, // total variant count (n)
+    name: String,
+    pct: f32,
+    done: bool,
+    failed: bool,
+    sla: Option<f32>,
+}
+
+/// Parse a `SimBatch::run` progress line of the form
+/// `[  i/n] <name>  sim X%` or `[  i/n] <name>  done (Ns) — SLA overall: Y%`
+/// or `[  i/n] <name>  FAILED: …`. Returns `None` for non-progress lines.
+fn parse_variant_progress(line: &str) -> Option<ParsedProgress> {
+    let line = line.trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+    let close = line.find(']')?;
+    let (i_str, n_str) = line[1..close].split_once('/')?;
+    let i: usize = i_str.trim().parse().ok()?;
+    let n: usize = n_str.trim().parse().ok()?;
+    if i == 0 || i > n {
+        return None;
+    }
+    let rest = line[close + 1..].trim_start();
+
+    let mk = |name: &str, pct: f32, done: bool, failed: bool, sla: Option<f32>| ParsedProgress {
+        index: i - 1,
+        index_count: n,
+        name: name.trim_end().to_string(),
+        pct,
+        done,
+        failed,
+        sla,
+    };
+
+    if let Some(pos) = rest.find(" sim ") {
+        let pct = rest[pos + 5..].trim().trim_end_matches('%').trim().parse().ok()?;
+        Some(mk(&rest[..pos], pct, false, false, None))
+    } else if let Some(pos) = rest.find(" done") {
+        let sla = rest
+            .split("SLA overall:")
+            .nth(1)
+            .and_then(|s| s.trim().trim_end_matches('%').trim().parse::<f32>().ok());
+        Some(mk(&rest[..pos], 100.0, true, false, sla))
+    } else if let Some(pos) = rest.find(" FAILED") {
+        Some(mk(&rest[..pos], 100.0, true, true, None))
+    } else {
+        None
     }
 }
 

@@ -140,6 +140,7 @@ fn run_whatif_patrol(args: &[String]) {
 
     let mut strategy_filter: Vec<String> = Vec::new();
     let mut include_aid = true;
+    let mut include_patrols = true;
     let mut sim_duration: Option<u64> = None;
     let mut i = 3;
     while i < args.len() {
@@ -154,6 +155,7 @@ fn run_whatif_patrol(args: &[String]) {
                 }
             }
             "--no-aid" => { include_aid = false; i += 1; }
+            "--no-patrol" => { include_patrols = false; i += 1; }
             other => {
                 if let Ok(dur) = other.parse::<u64>() {
                     sim_duration = Some(dur);
@@ -173,46 +175,62 @@ fn run_whatif_patrol(args: &[String]) {
         .map(|d| (d.id, d.name.clone(), d.unit_count))
         .collect();
 
-    // Discover patrol_routes_*.json under config/
-    let mut all_routes: Vec<(String, String)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir("config") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
-            let stem = match path.file_stem().and_then(|s| s.to_str()) {
-                Some(s) => s,
-                None => continue,
-            };
-            if let Some(label) = stem.strip_prefix("patrol_routes_") {
-                all_routes.push((label.to_string(), path.to_string_lossy().into_owned()));
+    // Discover patrol_routes_*.json under config/ (skipped entirely with --no-patrol,
+    // which compares only the standard reference against mutual-aid-only).
+    let route_paths: Vec<(String, String)> = if include_patrols {
+        let mut all_routes: Vec<(String, String)> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("config") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+                let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if let Some(label) = stem.strip_prefix("patrol_routes_") {
+                    all_routes.push((label.to_string(), path.to_string_lossy().into_owned()));
+                }
             }
         }
-    }
-    all_routes.sort_by(|a, b| a.0.cmp(&b.0));
+        all_routes.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let route_paths: Vec<(String, String)> = if strategy_filter.is_empty() {
-        all_routes
+        let filtered: Vec<(String, String)> = if strategy_filter.is_empty() {
+            all_routes
+        } else {
+            all_routes.into_iter()
+                .filter(|(label, _)| strategy_filter.iter().any(|s| s == label))
+                .collect()
+        };
+
+        if filtered.is_empty() {
+            eprintln!("error: no patrol_routes_*.json files found in config/ (or none matched the --strategy filter)");
+            eprintln!("hint: run `cargo run --bin patrol_gen -- {config_path} hotspot` first,");
+            eprintln!("      or pass --no-patrol to compare only the standard sim against mutual-aid-only");
+            process::exit(1);
+        }
+        filtered
     } else {
-        all_routes.into_iter()
-            .filter(|(label, _)| strategy_filter.iter().any(|s| s == label))
-            .collect()
+        Vec::new()
     };
 
-    if route_paths.is_empty() {
-        eprintln!("error: no patrol_routes_*.json files found in config/ (or none matched the --strategy filter)");
-        eprintln!("hint: run `cargo run --bin patrol_gen -- {config_path} hotspot` first");
-        process::exit(1);
-    }
+    let strategies_label = if route_paths.is_empty() {
+        "(none — patrols disabled)".to_string()
+    } else {
+        route_paths.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", ")
+    };
 
     println!("What-If Patrol Strategy Comparison");
     println!("  Config:    {config_path}");
     println!("  Districts: {}", base_counts.len());
-    println!("  Strategies: {}", route_paths.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join(", "));
+    println!("  Strategies: {strategies_label}");
     println!("  Mutual aid variants: {}", if include_aid { "yes" } else { "no" });
     if let Some(d) = sim_duration {
         println!("  Sim duration: {d} min (shortened)");
     }
 
+    // `generate_patrol_variants` always emits the standard (no patrol, no aid)
+    // base reference first; with no route paths it emits just that plus the
+    // mutual-aid-only variant.
     let mut variants = generate_patrol_variants(&base_counts, &route_paths);
     if !include_aid {
         variants.retain(|v| {

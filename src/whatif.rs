@@ -454,7 +454,14 @@ pub fn generate_patrol_variants(
         base_counts.iter().map(|(id, _, c)| (*id, *c)).collect();
 
     let mut out = Vec::new();
-    out.push(Variant::realloc("Baseline (no patrol, no aid)", baseline_counts.clone()));
+    // The standard sim / base reference: explicitly no patrols and aid disabled,
+    // independent of whatever `mutual_aid_enabled` happens to be in city.toml.
+    out.push(Variant {
+        name:               "Standard (no patrol, no aid)".to_string(),
+        unit_counts:        Some(baseline_counts.clone()),
+        patrol_routes_path: None,
+        mutual_aid:         Some(false),
+    });
     out.push(Variant {
         name:               "Mutual aid only".to_string(),
         unit_counts:        Some(baseline_counts.clone()),
