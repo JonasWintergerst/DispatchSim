@@ -156,7 +156,7 @@ fn main() {
     println!("Snapping {} cells to nearest OSM nodes…", cells.len());
     let hexes: Vec<H3Hex> = cells.par_iter().map(|(cell, lat, lon)| {
         // Cells start as "residential"; real land-use profiles (commercial/
-        // mixed) are assigned after solving from OSM POI density — see step 8b.
+        // mixed) and their spawn_rate are assigned in step 5c, before solving.
         let profile_id = "residential".to_string();
         let spawn_rate = spawn_cfg.spawn_profiles
             .get(&profile_id)
@@ -182,12 +182,41 @@ fn main() {
     println!("Computing main road-network component…");
     let main_nodes = osm.main_component_node_ids();
     let before = hexes.len();
-    let hexes: Vec<H3Hex> = hexes.into_iter()
+    let mut hexes: Vec<H3Hex> = hexes.into_iter()
         .filter(|h| main_nodes.contains(&dispatch_sim::types::NodeId::new(h.nearest_osm_node)))
         .collect();
     let removed = before - hexes.len();
     if removed > 0 {
         println!("  → Filtered {} disconnected hexes ({} remain)", removed, hexes.len());
+    }
+
+    // 5c. Assign land-use spawn profiles from OSM commercial-POI density, and set
+    //     each cell's spawn_rate accordingly. Done *before* the solver so the
+    //     p-median objective weights demand by real call volume (commercial cells
+    //     ~3× residential) and the workload-balance constraint balances call
+    //     volume rather than hex count. Profiles depend only on cell location, so
+    //     this is independent of the districting (no circularity).
+    println!("Assigning spawn profiles from OSM land-use…");
+    let indices: Vec<u64> = hexes.iter().map(|h| h.index).collect();
+    match dispatch_sim::profiles::classify_hexes(&indices, Path::new(&cfg.osm_path)) {
+        Ok(profiles) => {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for h in &mut hexes {
+                if let Some(p) = profiles.get(&h.index) {
+                    h.profile_id = p.clone();
+                    h.spawn_rate = spawn_cfg.spawn_profiles
+                        .get(p)
+                        .map(|c| c.base_lambda / 60.0)
+                        .unwrap_or(h.spawn_rate);
+                }
+                *counts.entry(h.profile_id.as_str()).or_insert(0) += 1;
+            }
+            println!("  → residential {} / mixed {} / commercial {}",
+                     counts.get("residential").copied().unwrap_or(0),
+                     counts.get("mixed").copied().unwrap_or(0),
+                     counts.get("commercial").copied().unwrap_or(0));
+        }
+        Err(e) => eprintln!("warning: profile assignment failed ({e}); keeping residential"),
     }
 
     // 6. Load candidate stations and snap each to the nearest OSM road node.
@@ -295,7 +324,7 @@ fn main() {
     println!("  → adjacency filtered");
 
     // 7c. Build problem.
-    let mut problem = Problem {
+    let problem = Problem {
         hexes,
         candidate_stations: candidates,
         n_districts: cfg.n_districts,
@@ -337,32 +366,6 @@ fn main() {
 
     if cfg.constraints.contiguity {
         println!("Contiguity: enforced");
-    }
-
-    // 8b. Assign land-use spawn profiles from OSM commercial-POI density.
-    //     Done after solving so it does not change the p-median districting
-    //     (which weights by spawn_rate); it only sets each hex's profile.
-    println!("Assigning spawn profiles from OSM land-use…");
-    let indices: Vec<u64> = problem.hexes.iter().map(|h| h.index).collect();
-    match dispatch_sim::profiles::classify_hexes(&indices, Path::new(&cfg.osm_path)) {
-        Ok(profiles) => {
-            let mut counts: HashMap<&str, usize> = HashMap::new();
-            for h in &mut problem.hexes {
-                if let Some(p) = profiles.get(&h.index) {
-                    h.profile_id = p.clone();
-                    h.spawn_rate = spawn_cfg.spawn_profiles
-                        .get(p)
-                        .map(|c| c.base_lambda / 60.0)
-                        .unwrap_or(h.spawn_rate);
-                }
-                *counts.entry(h.profile_id.as_str()).or_insert(0) += 1;
-            }
-            println!("  → residential {} / mixed {} / commercial {}",
-                     counts.get("residential").copied().unwrap_or(0),
-                     counts.get("mixed").copied().unwrap_or(0),
-                     counts.get("commercial").copied().unwrap_or(0));
-        }
-        Err(e) => eprintln!("warning: profile assignment failed ({e}); keeping residential"),
     }
 
     // 9. Write hexes.json.
