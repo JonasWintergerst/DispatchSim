@@ -7,9 +7,10 @@
 # Source basis: German Polizeieinsatzstatistik / APCO/IACP benchmarks
 #   ~300 dispatched calls/day  (≈ 1 per 1 000 residents/day, typical DE/EU)
 #   ~12.7 calls/hour at baseline multipliers = 1.0
-#   80 patrol units → expected utilisation ≈ 16 % at avg 60 min total engagement
-#   (travel + on-scene + return; 300 calls/day, load = 300/(80×24) = 15.6 %)
-#   Range: PK 15 = 7 units (Reeperbahn peak) → outer suburban PKs = 2 units
+#   89 units (demand-proportional) → expected utilisation ≈ 14 % at avg 60 min
+#   total engagement (travel + on-scene + return); 304 calls/day,
+#   load = 304×60 / (89×1440) ≈ 14.2 %
+#   Range: PK 13 = 12 units (densest district) → outer suburban PKs = 2 units
 #
 # Priority classification used (APCO CAD standard, also aligns with DE Einsatzklassen):
 #   Priority A  →  immediate / life threat  (P1 / Einsatz 1) — lights & sirens
@@ -97,7 +98,7 @@ lon_max = 10.330
 [[districts]]
 id           = 0
 name         = "PK 11"
-unit_count   = 7
+unit_count   = 2
 patrol_units = 2
 
 [[districts]]
@@ -109,91 +110,91 @@ patrol_units = 1
 [[districts]]
 id           = 2
 name         = "PK 13"
-unit_count   = 11
+unit_count   = 12
 patrol_units = 1
 
 [[districts]]
 id           = 3
 name         = "PK 14"
-unit_count   = 25
-patrol_units = 8
+unit_count   = 2
+patrol_units = 2
 
 [[districts]]
 id           = 4
 name         = "PK 15"
-unit_count   = 12
+unit_count   = 6
 patrol_units = 4
 
 [[districts]]
 id           = 5
 name         = "PK 16"
-unit_count   = 11
+unit_count   = 6
 patrol_units = 3
 
 [[districts]]
 id           = 6
 name         = "PK 17"
-unit_count   = 4
+unit_count   = 6
 patrol_units = 1
 
 [[districts]]
 id           = 7
 name         = "PK 21"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 1
 
 [[districts]]
 id           = 8
 name         = "PK 22"
-unit_count   = 8
+unit_count   = 4
 patrol_units = 2
 
 [[districts]]
 id           = 9
 name         = "PK 23"
-unit_count   = 8
+unit_count   = 4
 patrol_units = 2
 
 [[districts]]
 id           = 10
 name         = "PK 24"
-unit_count   = 4
+unit_count   = 3
 patrol_units = 1
 
 [[districts]]
 id           = 11
 name         = "PK 25"
-unit_count   = 8
+unit_count   = 5
 patrol_units = 2
 
 [[districts]]
 id           = 12
 name         = "PK 26"
-unit_count   = 4
+unit_count   = 3
 patrol_units = 1
 
 [[districts]]
 id           = 13
 name         = "PK 27"
-unit_count   = 6
+unit_count   = 5
 patrol_units = 1
 
 [[districts]]
 id           = 14
 name         = "PK 31"
-unit_count   = 6
+unit_count   = 2
 patrol_units = 2
 
 [[districts]]
 id           = 15
 name         = "PK 32"
-unit_count   = 6
+unit_count   = 3
 patrol_units = 2
 
 [[districts]]
 id           = 16
 name         = "PK 33"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 1
 
 [[districts]]
@@ -205,47 +206,51 @@ patrol_units = 0
 [[districts]]
 id           = 18
 name         = "PK 35"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 0
 
 [[districts]]
 id           = 19
 name         = "PK 36"
-unit_count   = 4
+unit_count   = 3
 patrol_units = 1
 
 [[districts]]
 id           = 20
 name         = "PK 41"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 1
 
 [[districts]]
 id           = 21
 name         = "PK 42"
-unit_count   = 4
+unit_count   = 3
 patrol_units = 1
 
 [[districts]]
 id           = 22
 name         = "PK 43"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 1
 
 [[districts]]
 id           = 23
 name         = "PK 46"
-unit_count   = 4
+unit_count   = 2
 patrol_units = 0
 
 # ---------------------------------------------------------------------------
 # Spawn profiles
 #
 # base_lambda: incidents per HEX per HOUR at all multipliers = 1.0
+#   Profiles are assigned per hex from real Hamburg land-use (OSM commercial-POI
+#   density) by the `assign_profiles` binary; counts below come from that run.
+#   λ values preserve the literature intensity ratio (commercial : mixed :
+#   residential ≈ 3 : 1.6 : 1) scaled so the city-wide rate matches ~304/day.
 #   Total city rate = Σ (lambda_i × hex_count_i)
-#   residential: 1650 × 0.0037 = 6.11 /hr
-#   commercial:   289 × 0.0110 = 3.18 /hr
-#   mixed:        561 × 0.0060 = 3.37 /hr
+#   residential: 5629 × 0.001147 = 6.46 /hr
+#   commercial:   868 × 0.003411 = 2.96 /hr
+#   mixed:       1741 × 0.001861 = 3.24 /hr
 #   ──────────────────────────────────────
 #   Total baseline:             12.66 /hr  ≈ 304 calls/day
 #
@@ -268,7 +273,7 @@ patrol_units = 0
 [spawn_profiles.residential]
 # Mainly domestic disputes, street crime, welfare checks.
 # Peaks Friday/Saturday nights 22:00–03:00.
-base_lambda        = 0.0037
+base_lambda        = 0.001147   # recalibrated for 5629 residential hexes (see header)
 
 #                    00    01    02    03    04    05    06    07    08    09    10    11
 hour_multiplier    = [1.20, 1.37, 1.45, 1.11, 0.60, 0.43, 0.43, 0.60, 0.77, 0.85, 0.85, 0.85,
@@ -302,7 +307,7 @@ weight = 0.10          # alarm activation / assist fire brigade
 # Business district: shoplifting, parking disputes, commercial burglary,
 # peaks during trading hours (09–18) and early evening.
 # Much lower overnight and on weekends (reduced footfall).
-base_lambda        = 0.0110
+base_lambda        = 0.003411   # recalibrated for 868 commercial hexes (see header)
 
 #                    00    01    02    03    04    05    06    07    08    09    10    11
 hour_multiplier    = [0.52, 0.31, 0.26, 0.26, 0.26, 0.31, 0.52, 0.84, 1.25, 1.57, 1.67, 1.67,
@@ -335,7 +340,7 @@ weight = 0.10          # commercial fire alarm, kitchen fire
 [spawn_profiles.mixed]
 # Mixed residential/commercial: intermediate pattern.
 # Moderate night activity, notable business-hours peak.
-base_lambda        = 0.0060
+base_lambda        = 0.001861   # recalibrated for 1741 mixed hexes (see header)
 
 #                    00    01    02    03    04    05    06    07    08    09    10    11
 hour_multiplier    = [0.92, 1.13, 1.33, 1.07, 0.58, 0.40, 0.40, 0.58, 0.80, 0.92, 0.92, 0.92,
