@@ -239,7 +239,7 @@ fn main() {
         for h in 0..n {
             let node = NodeId::new(hexes[h].nearest_osm_node);
             let d = tt.get(&node)
-                .map(|&t| t as f64)
+                .map(|&t| t as f64 / 60.0) // seconds → minutes (keeps objective scale)
                 .unwrap_or(f64::MAX / 2.0); // unreachable → effectively infinite
             dist_cs.push(d);
         }
@@ -254,8 +254,8 @@ fn main() {
         .map(|(i, h)| (h.index, i)).collect();
 
     // Collect unique hex OSM nodes and precompute bounded travel times from each.
-    // The bound of 10 min covers all possible H3 neighbor checks (neighbours are
-    // ~200 m apart; the max_time threshold is 3× haversine / 500 m/min, min 5 min).
+    // The bound of 600 s (10 min) covers all possible H3 neighbor checks
+    // (neighbours are ~200 m apart; edge weights are now in seconds).
     let mut unique_hex_nodes: Vec<u32> = hexes.iter().map(|h| h.nearest_osm_node).collect();
     unique_hex_nodes.sort();
     unique_hex_nodes.dedup();
@@ -267,7 +267,7 @@ fn main() {
         .par_iter()
         .map(|&node_raw| {
             let node = NodeId::new(node_raw);
-            let times = osm.bounded_single_source(node, &hex_node_set, 10);
+            let times = osm.bounded_single_source(node, &hex_node_set, 600);
             (node, times)
         })
         .collect();

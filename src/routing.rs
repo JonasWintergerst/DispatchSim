@@ -36,7 +36,10 @@ pub struct Node {
 }
 
 pub struct Edge {
-    pub travel_time_min: u32,
+    /// Edge traversal time in **seconds**. Sub-minute road segments must not be
+    /// rounded per edge (that inflates summed paths); the matrix converts the
+    /// accumulated seconds to minutes once, at build time.
+    pub travel_time_sec: u32,
 }
 
 pub type RoadGraph = Graph<Node, Edge>;
@@ -140,7 +143,8 @@ impl RoutingEngine {
             let from_nx = node_index[&node_id];
             for (dc, dr) in NEIGHBOURS {
                 if let Some(&to_nx) = coord_index.get(&(coord.col + dc, coord.row + dr)) {
-                    graph.add_edge(from_nx, to_nx, Edge { travel_time_min: 1 });
+                    // 60 s = 1 min per hop, so a hex step converts to 1 minute.
+                    graph.add_edge(from_nx, to_nx, Edge { travel_time_sec: 60 });
                 }
             }
         }
@@ -187,11 +191,13 @@ impl RoutingEngine {
             .par_iter()
             .flat_map_iter(|&src| {
                 let src_nx = node_index[&src];
-                let dist = dijkstra(&graph, src_nx, None, |e| e.weight().travel_time_min);
+                // Dijkstra accumulates edge times in seconds (exact, no per-edge
+                // rounding); convert the full-path total to minutes once here.
+                let dist = dijkstra(&graph, src_nx, None, |e| e.weight().travel_time_sec);
                 let mut row = vec![u32::MAX; k];
-                for (target_nx, cost) in dist {
+                for (target_nx, cost_sec) in dist {
                     if let Some(&j) = anchor_index.get(&graph[target_nx].id) {
-                        row[j as usize] = cost;
+                        row[j as usize] = (cost_sec + 30) / 60; // seconds → minutes, rounded
                     }
                 }
                 row
@@ -364,18 +370,18 @@ mod tests {
         assert_eq!(engine.route_between(a, a), vec![a]);
     }
 
-    /// A line graph A—B—C—D with bidirectional, equal-weight edges. Node `i`
-    /// sits at lon `i*0.01`, lat 0 — far enough apart that a haversine estimate
-    /// is clearly distinct from the true path cost.
+    /// A line graph A—B—C—D with bidirectional edges. Node `i` sits at
+    /// lon `i*0.01`, lat 0. Edge weights are in seconds (120/180/240 s), so the
+    /// A→D path totals 540 s = 9 min after the matrix's once-per-cell rounding.
     fn line_graph() -> (RoadGraph, Vec<NodeId>) {
         let mut g = RoadGraph::new();
         let ids: Vec<NodeId> = (0..4).map(NodeId::new).collect();
         let nxs: Vec<NodeIndex> = ids.iter().enumerate()
             .map(|(i, &id)| g.add_node(Node { id, position: Point::new(i as f64 * 0.01, 0.0) }))
             .collect();
-        for &(a, b, w) in &[(0usize, 1usize, 2u32), (1, 2, 3), (2, 3, 4)] {
-            g.add_edge(nxs[a], nxs[b], Edge { travel_time_min: w });
-            g.add_edge(nxs[b], nxs[a], Edge { travel_time_min: w });
+        for &(a, b, w) in &[(0usize, 1usize, 120u32), (1, 2, 180), (2, 3, 240)] {
+            g.add_edge(nxs[a], nxs[b], Edge { travel_time_sec: w });
+            g.add_edge(nxs[b], nxs[a], Edge { travel_time_sec: w });
         }
         (g, ids)
     }

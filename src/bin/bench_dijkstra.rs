@@ -69,11 +69,11 @@ fn main() {
     }
     println!();
 
-    // ── Benchmark 2: bounded single-source Dijkstra (max_cost=10) ──────
-    println!("=== Benchmark 2: bounded_single_source (max_cost=10 min) ===");
+    // ── Benchmark 2: bounded single-source Dijkstra (max_cost=600 s) ──────
+    println!("=== Benchmark 2: bounded_single_source (max_cost=600 s / 10 min) ===");
     for (i, &node) in sample_nodes.iter().enumerate() {
         let t = Instant::now();
-        let result = osm.bounded_single_source(node, &hex_node_set, 10);
+        let result = osm.bounded_single_source(node, &hex_node_set, 600);
         let ms = t.elapsed().as_millis();
         println!("  run {}: node={:>6}  → {} targets hit  ({ms} ms)",
             i + 1, node.value(), result.len());
@@ -81,11 +81,11 @@ fn main() {
     println!();
 
     // ── Benchmark 3: bounded single-source batch (all hex nodes) ───────
-    println!("=== Benchmark 3: bounded Dijkstra batch ({} hex nodes, max_cost=10) ===", anchor_ids.len());
+    println!("=== Benchmark 3: bounded Dijkstra batch ({} hex nodes, max_cost=600 s) ===", anchor_ids.len());
     {
         let t = Instant::now();
         let _results: Vec<_> = anchor_ids.iter().map(|&node| {
-            osm.bounded_single_source(node, &hex_node_set, 10)
+            osm.bounded_single_source(node, &hex_node_set, 600)
         }).collect();
         let ms = t.elapsed().as_millis();
         let secs = ms as f64 / 1000.0;
@@ -96,7 +96,7 @@ fn main() {
         use rayon::prelude::*;
         let t = Instant::now();
         let _results: Vec<_> = anchor_ids.par_iter().map(|&node| {
-            osm.bounded_single_source(node, &hex_node_set, 10)
+            osm.bounded_single_source(node, &hex_node_set, 600)
         }).collect();
         let ms = t.elapsed().as_millis();
         let secs = ms as f64 / 1000.0;

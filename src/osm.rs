@@ -129,10 +129,14 @@ impl OsmGraph {
                     if let (Some(&(a_lat, a_lon)), Some(&(b_lat, b_lon))) =
                         (raw_nodes.get(&a_osm), raw_nodes.get(&b_osm))
                     {
-                        let dist_m   = haversine_m(a_lat, a_lon, b_lat, b_lon);
-                        let time_min = ((dist_m / speed) as u32).max(1);
-                        graph.add_edge(a_nx, b_nx, Edge { travel_time_min: time_min });
-                        graph.add_edge(b_nx, a_nx, Edge { travel_time_min: time_min });
+                        let dist_m = haversine_m(a_lat, a_lon, b_lat, b_lon);
+                        // `speed` is m/min, so dist_m/speed is minutes; ×60 → seconds.
+                        // Store seconds with NO per-edge minute floor — OSM splits
+                        // streets into sub-minute segments, and rounding each one up
+                        // to 1 min inflated summed paths ~5–15× (the old `.max(1)`).
+                        let time_sec = ((dist_m / speed) * 60.0).round() as u32;
+                        graph.add_edge(a_nx, b_nx, Edge { travel_time_sec: time_sec });
+                        graph.add_edge(b_nx, a_nx, Edge { travel_time_sec: time_sec });
                     }
                 }
             }
@@ -194,8 +198,8 @@ impl OsmGraph {
         for edge_idx in self.graph.edge_indices() {
             let (a, b) = self.graph.edge_endpoints(edge_idx).unwrap();
             if let (Some(&new_a), Some(&new_b)) = (old_to_new.get(&a), old_to_new.get(&b)) {
-                let weight = self.graph[edge_idx].travel_time_min;
-                sub.add_edge(new_a, new_b, Edge { travel_time_min: weight });
+                let weight = self.graph[edge_idx].travel_time_sec;
+                sub.add_edge(new_a, new_b, Edge { travel_time_sec: weight });
             }
         }
 
@@ -217,8 +221,8 @@ impl OsmGraph {
 
         for edge_idx in self.graph.edge_indices() {
             let (a, b) = self.graph.edge_endpoints(edge_idx).unwrap();
-            let weight = self.graph[edge_idx].travel_time_min;
-            out.add_edge(old_to_new[&a], old_to_new[&b], Edge { travel_time_min: weight });
+            let weight = self.graph[edge_idx].travel_time_sec;
+            out.add_edge(old_to_new[&a], old_to_new[&b], Edge { travel_time_sec: weight });
         }
 
         out
@@ -238,31 +242,31 @@ impl OsmGraph {
     }
 
     /// Dijkstra from `source` to all reachable nodes.
-    /// Returns NodeId → travel_time_min for every reachable node.
+    /// Returns NodeId → travel time in **seconds** for every reachable node.
     pub fn single_source_travel_times(&self, source: NodeId) -> HashMap<NodeId, u32> {
         let Some(&source_nx) = self.node_index.get(&source) else {
             return HashMap::new();
         };
-        dijkstra(&self.graph, source_nx, None, |e| e.weight().travel_time_min)
+        dijkstra(&self.graph, source_nx, None, |e| e.weight().travel_time_sec)
             .into_iter()
             .map(|(nx, cost)| (self.graph[nx].id, cost))
             .collect()
     }
 
     /// Bounded Dijkstra: returns `Some(cost)` if `to` is reachable from `from`
-    /// within `max_cost` travel-time minutes, `None` otherwise.
+    /// within `max_cost` travel-time **seconds**, `None` otherwise.
     pub fn bounded_travel_time(&self, from: NodeId, to: NodeId, max_cost: u32) -> Option<u32> {
         let (Some(&from_nx), Some(&to_nx)) =
             (self.node_index.get(&from), self.node_index.get(&to))
         else {
             return None;
         };
-        let costs = dijkstra(&self.graph, from_nx, Some(to_nx), |e| e.weight().travel_time_min);
+        let costs = dijkstra(&self.graph, from_nx, Some(to_nx), |e| e.weight().travel_time_sec);
         costs.get(&to_nx).copied().filter(|&c| c <= max_cost)
     }
 
-    /// Bounded single-source Dijkstra: returns travel times from `source` to
-    /// all nodes in `targets` reachable within `max_cost` minutes.
+    /// Bounded single-source Dijkstra: returns travel times (seconds) from
+    /// `source` to all nodes in `targets` reachable within `max_cost` **seconds**.
     /// Stops exploring once all settled nodes exceed `max_cost`.
     pub fn bounded_single_source(
         &self,
@@ -295,7 +299,7 @@ impl OsmGraph {
             }
             for edge in self.graph.edges(nx) {
                 let next = edge.target();
-                let next_cost = cost + edge.weight().travel_time_min;
+                let next_cost = cost + edge.weight().travel_time_sec;
                 if next_cost <= max_cost && next_cost < dist.get(&next).copied().unwrap_or(u32::MAX) {
                     dist.insert(next, next_cost);
                     heap.push(std::cmp::Reverse((next_cost, next)));
