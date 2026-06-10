@@ -361,10 +361,14 @@ fn main() {
 
     // 11. Build and persist the routing cache for the simulator.
     //
-    // We build a single city-wide RoutingEngine from the full OSM graph with
-    // anchors from ALL districts (hex nodes + station nodes). This gives
-    // every district seamless cross-border routing — essential for mutual aid.
-    // The sim loads one shared engine and assigns it to every district.
+    // We build a single city-wide RoutingEngine from the full OSM graph and
+    // precompute the full anchor↔anchor travel-time matrix. The anchor set is
+    // every hex's representative OSM node plus the selected station nodes. Since
+    // incidents spawn at their hex anchor, patrol waypoints are hex anchors, and
+    // units live at station anchors, every dispatch endpoint is an anchor — so
+    // the matrix answers every travel-time query with an O(1) lookup and the
+    // simulator never runs an online shortest-path search. One shared engine
+    // serves every district, giving seamless cross-border routing for mutual aid.
     let cache_path = cfg.routing_cache_output_path
         .as_deref()
         .unwrap_or("output/routing_cache.bin");
@@ -378,22 +382,23 @@ fn main() {
         hexes_by_district.entry(did).or_default().push(h);
     }
 
-    // Collect ALL anchors across all districts: every hex node + every station node.
-    let mut all_anchors: Vec<NodeId> = problem.hexes.iter()
+    // Routing anchors = every hex's representative OSM node + every selected
+    // station node. This is the full anchor set the matrix is built over.
+    let mut source_nodes: Vec<NodeId> = problem.hexes.iter()
         .map(|h| NodeId::new(h.nearest_osm_node))
+        .chain((0..cfg.n_districts as u32).map(|district_id| {
+            let station_idx = solution.station_indices[district_id as usize];
+            NodeId::new(problem.candidate_stations[station_idx].nearest_osm_node)
+        }))
         .collect();
-    for district_id in 0..cfg.n_districts as u32 {
-        let station_idx = solution.station_indices[district_id as usize];
-        all_anchors.push(NodeId::new(problem.candidate_stations[station_idx].nearest_osm_node));
-    }
-    all_anchors.sort_by_key(|n| n.value());
-    all_anchors.dedup();
-    println!("  → {} unique anchor nodes across all districts", all_anchors.len());
+    source_nodes.sort_by_key(|n| n.value());
+    source_nodes.dedup();
+    println!("  → {} unique anchor nodes (hex anchors + stations)", source_nodes.len());
 
     // Build one RoutingEngine on the full city OSM graph.
     let city_graph = osm.to_road_graph();
     println!("  → city graph: {} nodes, {} edges", city_graph.node_count(), city_graph.edge_count());
-    let engine = RoutingEngine::from_graph(city_graph, &all_anchors);
+    let engine = RoutingEngine::from_graph(city_graph, &source_nodes);
     let city_snapshot = engine.to_snapshot();
 
     // Per-district hex → OSM node maps.

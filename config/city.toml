@@ -33,7 +33,7 @@ tick_minutes     = 1
 duration_minutes = 2_102_400   # 4 simulated years
 rng_seed         = 42
 sim_type         = "Police"
-record_routes      = false
+record_routes      = true
 osm_path           = "config/hamburg-260331.osm.pbf"
 routing_cache_path = "output/routing_cache.bin"
 # Phase 2 — cross-district mutual aid. When enabled, an incident with no local

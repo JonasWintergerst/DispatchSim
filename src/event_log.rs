@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use rusqlite::{Connection, Result, params};
 
+use crate::routing::RouteStats;
 use crate::types::{DistrictId, IncidentId, UnitId};
 
 // ---------------------------------------------------------------------------
@@ -95,9 +96,36 @@ impl EventLog {
                 incident_id TEXT PRIMARY KEY,
                 path        TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS routing_stats (
+                source_forward INTEGER NOT NULL,
+                source_reverse INTEGER NOT NULL,
+                exact_computed INTEGER NOT NULL,
+                exact_cached   INTEGER NOT NULL,
+                haversine      INTEGER NOT NULL
+            );
         ")?;
 
         Ok(Self { conn })
+    }
+
+    /// Persist the travel-time resolution counters (single-row table; the
+    /// previous row, if any, is replaced).
+    pub fn write_routing_stats(&mut self, s: &RouteStats) -> Result<()> {
+        self.conn.execute("DELETE FROM routing_stats", [])?;
+        self.conn.execute(
+            "INSERT INTO routing_stats
+               (source_forward, source_reverse, exact_computed, exact_cached, haversine)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                s.source_forward as i64,
+                s.source_reverse as i64,
+                s.exact_computed as i64,
+                s.exact_cached   as i64,
+                s.haversine      as i64,
+            ],
+        )?;
+        Ok(())
     }
 
     /// Flush a batch of events in a single transaction.
@@ -144,5 +172,60 @@ impl EventLog {
         }
 
         tx.commit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        std::env::temp_dir()
+            .join(format!("dispatch_sim_{tag}_{nanos}.db"))
+            .to_string_lossy().into_owned()
+    }
+
+    fn cleanup(p: &str) {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(format!("{p}-wal"));
+        let _ = std::fs::remove_file(format!("{p}-shm"));
+    }
+
+    /// `write_routing_stats` persists the counters and keeps exactly one row
+    /// across repeated writes (so the report reads the latest snapshot, not a
+    /// growing history).
+    #[test]
+    fn routing_stats_round_trip_and_replace() {
+        let p = temp_db_path("routing_stats");
+        cleanup(&p);
+
+        let mut log = EventLog::open(&p).expect("open db");
+        let stats = RouteStats {
+            source_forward: 10, source_reverse: 5,
+            exact_computed: 3, exact_cached: 2, haversine: 1,
+        };
+        log.write_routing_stats(&stats).expect("write stats");
+
+        let conn = Connection::open(&p).expect("reopen");
+        let read = |c: &Connection| c.query_row(
+            "SELECT source_forward, source_reverse, exact_computed, exact_cached, haversine
+             FROM routing_stats",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
+        ).unwrap();
+        assert_eq!(read(&conn), (10, 5, 3, 2, 1));
+
+        // A second write replaces the row rather than appending.
+        log.write_routing_stats(&stats).expect("rewrite");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM routing_stats", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(count, 1, "write_routing_stats must keep a single row");
+
+        drop(conn);
+        cleanup(&p);
     }
 }

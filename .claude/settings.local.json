@@ -7,7 +7,8 @@
       "Bash(ls:*)",
       "Bash(cargo clippy *)",
       "WebSearch",
-      "Bash(cargo check *)"
+      "Bash(cargo check *)",
+      "Bash(git -C C:/Users/Jonas/Documents/Projekte/dispatch_sim ls-files \"src/*\" \"*.toml\")"
     ]
   }
 }

@@ -4,8 +4,9 @@
 //   - route_between: lazy A* with RwLock cache (Sync for Rayon districts).
 // Phase 2b hook: from_graph() accepts any externally-built RoadGraph (e.g. OSM).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use geo::Point;
 use petgraph::algo::{astar, dijkstra};
@@ -39,8 +40,48 @@ pub type RoadGraph = Graph<Node, Edge>;
 pub struct RoutingSnapshot {
     pub nodes: Vec<(u32, f64, f64)>,    // (node_id_raw, lon, lat)
     pub edges: Vec<(u32, u32, u32)>,    // (from_id_raw, to_id_raw, travel_time_min)
-    pub times: Vec<(u32, u32, u32)>,    // (from_id_raw, to_id_raw, cost)
-    pub anchors: Vec<u32>,              // anchor node ID values
+    pub anchors: Vec<u32>,              // anchor node ID values, in matrix index order
+    pub matrix: Vec<u32>,              // row-major K×K travel times; u32::MAX = unreachable
+}
+
+// ---------------------------------------------------------------------------
+// Travel-time resolution counters
+// ---------------------------------------------------------------------------
+
+/// How each `travel_time` query was answered. Used purely for instrumentation
+/// (surfaced in the post-run report) so the precomputed-vs-lazy-vs-fallback
+/// split is observable.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RouteStats {
+    /// Hit the precomputed anchor↔anchor matrix (the fast O(1) common case).
+    pub source_forward: u64,
+    /// Reserved (was symmetry-reverse row lookup); always 0 with the full matrix.
+    pub source_reverse: u64,
+    /// Resolved by a freshly computed exact A* shortest path.
+    pub exact_computed: u64,
+    /// Resolved from the memoised exact-cost cache (a repeat of a residual pair).
+    pub exact_cached:   u64,
+    /// Fell back to a haversine estimate because no path exists (disconnected).
+    pub haversine:      u64,
+}
+
+impl RouteStats {
+    pub fn total(&self) -> u64 {
+        self.source_forward + self.source_reverse + self.exact_computed
+            + self.exact_cached + self.haversine
+    }
+}
+
+/// Atomic counters behind `RouteStats`. `travel_time` takes `&self` and is
+/// called concurrently across rayon workers, so the counts are atomic; `Relaxed`
+/// is sufficient since we only need an accurate final tally, not ordering.
+#[derive(Default)]
+struct RouteCounters {
+    source_forward: AtomicU64,
+    source_reverse: AtomicU64,
+    exact_computed: AtomicU64,
+    exact_cached:   AtomicU64,
+    haversine:      AtomicU64,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,10 +91,22 @@ pub struct RoutingSnapshot {
 pub struct RoutingEngine {
     graph:      RoadGraph,
     node_index: HashMap<NodeId, NodeIndex>,
-    /// Precomputed all-pairs travel times; O(1) lookup.
-    times:  HashMap<(NodeId, NodeId), u32>,
+    /// Anchor nodes in matrix index order (cell anchors + station nodes). Every
+    /// dispatch endpoint is one of these.
+    anchors:       Vec<NodeId>,
+    /// Anchor node → its row/column index in `matrix`.
+    anchor_index:  HashMap<NodeId, u32>,
+    /// Dense row-major K×K travel-time matrix between all anchor pairs
+    /// (`matrix[i*K + j]` = anchors[i] → anchors[j]); `u32::MAX` = unreachable.
+    /// Every query between two anchors is an O(1) lookup, no online search.
+    matrix:        Vec<u32>,
     /// Lazily-populated route cache; RwLock makes RoutingEngine Sync for Rayon.
     routes: RwLock<HashMap<(NodeId, NodeId), Vec<NodeId>>>,
+    /// Lazily-computed exact travel times for pairs where *neither* endpoint is
+    /// a precomputed source (e.g. incident → incident). Memoised; RwLock for Sync.
+    costs:  RwLock<HashMap<(NodeId, NodeId), u32>>,
+    /// Per-tier resolution counters for `travel_time` (instrumentation only).
+    counters: RouteCounters,
 }
 
 impl RoutingEngine {
@@ -90,49 +143,139 @@ impl RoutingEngine {
     }
 
     /// Build from an external road graph (OSM subgraph).
-    /// Only precomputes Dijkstra from `anchor_nodes` — the subset of nodes that
-    /// are actual incident/station locations. Keeps `travel_time()` O(1) for
-    /// anchor→any queries without running all-pairs on a large OSM subgraph.
-    pub fn from_graph(graph: RoadGraph, anchor_nodes: &[NodeId]) -> Self {
+    /// Precomputes the full anchor↔anchor travel-time matrix over the `sources`
+    /// (the cell anchors + station nodes). Every dispatch endpoint is an anchor,
+    /// so every `travel_time` query becomes an O(1) matrix lookup. Pairs with a
+    /// non-anchor endpoint (rare) are resolved lazily via A*.
+    pub fn from_graph(graph: RoadGraph, sources: &[NodeId]) -> Self {
         let node_index: HashMap<NodeId, NodeIndex> = graph
             .node_indices()
             .map(|nx| (graph[nx].id, nx))
             .collect();
-        Self::build(graph, node_index, anchor_nodes)
+        Self::build(graph, node_index, sources)
     }
 
-    fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>, anchors: &[NodeId]) -> Self {
-        // Only keep anchor→anchor travel times; anchor→intermediate-node distances
-        // are never queried and would otherwise inflate memory to O(|anchors|×|graph|).
-        let anchor_ids: HashSet<NodeId> = anchors.iter().copied().collect();
+    fn build(graph: RoadGraph, node_index: HashMap<NodeId, NodeIndex>, sources: &[NodeId]) -> Self {
+        // The anchor set: every source node present in the graph, deduplicated,
+        // in a stable index order. These index the K×K matrix below.
+        let mut anchors: Vec<NodeId> = Vec::with_capacity(sources.len());
+        let mut anchor_index: HashMap<NodeId, u32> = HashMap::with_capacity(sources.len());
+        for &s in sources {
+            if node_index.contains_key(&s) && !anchor_index.contains_key(&s) {
+                anchor_index.insert(s, anchors.len() as u32);
+                anchors.push(s);
+            }
+        }
+        let k = anchors.len();
 
-        let times: HashMap<(NodeId, NodeId), u32> = anchors
+        // One Dijkstra per anchor (in parallel); each yields that anchor's row of
+        // K costs. `par_iter().flat_map().collect()` preserves order, so anchor i's
+        // row lands at matrix[i*K .. (i+1)*K]. `u32::MAX` marks unreachable pairs.
+        let matrix: Vec<u32> = anchors
             .par_iter()
-            .filter_map(|&node_id| node_index.get(&node_id).map(|&nx| (node_id, nx)))
-            .flat_map(|(node_id, nx)| {
-                dijkstra(&graph, nx, None, |e| e.weight().travel_time_min)
-                    .into_iter()
-                    .filter(|(target_nx, _)| anchor_ids.contains(&graph[*target_nx].id))
-                    .map(|(target_nx, cost)| ((node_id, graph[target_nx].id), cost))
-                    .collect::<Vec<_>>()
+            .flat_map_iter(|&src| {
+                let src_nx = node_index[&src];
+                let dist = dijkstra(&graph, src_nx, None, |e| e.weight().travel_time_min);
+                let mut row = vec![u32::MAX; k];
+                for (target_nx, cost) in dist {
+                    if let Some(&j) = anchor_index.get(&graph[target_nx].id) {
+                        row[j as usize] = cost;
+                    }
+                }
+                row
             })
             .collect();
 
-        Self { graph, node_index, times, routes: RwLock::new(HashMap::new()) }
+        Self {
+            graph,
+            node_index,
+            anchors,
+            anchor_index,
+            matrix,
+            routes:   RwLock::new(HashMap::new()),
+            costs:    RwLock::new(HashMap::new()),
+            counters: RouteCounters::default(),
+        }
     }
 
     pub fn contains_node(&self, id: NodeId) -> bool {
         self.node_index.contains_key(&id)
     }
 
-    /// Travel time in simulated minutes between two nodes. O(1) lookup.
-    /// Falls back to a haversine estimate at 30 km/h when the pair is not
-    /// in the precomputed table (e.g. disconnected subgraph or missing anchor).
+    /// Travel time in simulated minutes between two nodes.
+    ///
+    /// Resolution order:
+    /// 1. The precomputed anchor↔anchor matrix `from → to` (O(1), lock-free) —
+    ///    the dominant path, since every dispatch endpoint (station, patrol
+    ///    waypoint, incident) is a hex anchor.
+    /// 2. An exact A* shortest path, memoised in `costs` — used only when an
+    ///    endpoint is *not* an anchor (rare). Cached, so it stays cheap.
+    /// 3. A haversine estimate at 30 km/h — only if the two nodes are not
+    ///    connected in the graph at all.
     pub fn travel_time(&self, from: NodeId, to: NodeId) -> u32 {
-        if let Some(&t) = self.times.get(&(from, to)) {
+        if from == to {
+            return 0;
+        }
+        if let (Some(&i), Some(&j)) =
+            (self.anchor_index.get(&from), self.anchor_index.get(&to))
+        {
+            let t = self.matrix[i as usize * self.anchors.len() + j as usize];
+            if t != u32::MAX {
+                self.counters.source_forward.fetch_add(1, Ordering::Relaxed);
+                return t;
+            }
+        }
+        if let Some(&t) = self.costs.read().unwrap().get(&(from, to)) {
+            self.counters.exact_cached.fetch_add(1, Ordering::Relaxed);
             return t;
         }
-        self.haversine_fallback(from, to)
+        let t = match self.exact_cost(from, to) {
+            Some(c) => {
+                self.counters.exact_computed.fetch_add(1, Ordering::Relaxed);
+                c
+            }
+            None => {
+                self.counters.haversine.fetch_add(1, Ordering::Relaxed);
+                self.haversine_fallback(from, to)
+            }
+        };
+        self.costs.write().unwrap().insert((from, to), t);
+        t
+    }
+
+    /// Snapshot of the travel-time resolution counters (see `RouteStats`).
+    /// All districts share one engine, so this reflects the whole simulation.
+    pub fn route_stats(&self) -> RouteStats {
+        RouteStats {
+            source_forward: self.counters.source_forward.load(Ordering::Relaxed),
+            source_reverse: self.counters.source_reverse.load(Ordering::Relaxed),
+            exact_computed: self.counters.exact_computed.load(Ordering::Relaxed),
+            exact_cached:   self.counters.exact_cached.load(Ordering::Relaxed),
+            haversine:      self.counters.haversine.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Exact point-to-point travel time via A* on the full graph. `None` if a
+    /// node is absent or no path exists. Used for the residual pairs that no
+    /// precomputed source row covers.
+    fn exact_cost(&self, from: NodeId, to: NodeId) -> Option<u32> {
+        let from_nx = *self.node_index.get(&from)?;
+        let to_nx   = *self.node_index.get(&to)?;
+        // Admissible heuristic: straight-line distance at the fastest road speed
+        // (100 km/h ≈ 1666 m/min) can never overestimate the true travel time.
+        const MAX_SPEED_M_PER_MIN: f64 = 100_000.0 / 60.0;
+        let goal = self.graph[to_nx].position;
+        astar(
+            &self.graph,
+            from_nx,
+            |nx| nx == to_nx,
+            |e| e.weight().travel_time_min,
+            |nx| {
+                let p = self.graph[nx].position;
+                (haversine_m(p.y(), p.x(), goal.y(), goal.x()) / MAX_SPEED_M_PER_MIN) as u32
+            },
+        )
+        .map(|(cost, _)| cost)
     }
 
     /// Haversine estimate at 30 km/h between two node positions.
@@ -213,19 +356,9 @@ impl RoutingEngine {
             (self.graph[a].id.value(), self.graph[b].id.value(), self.graph[ex].travel_time_min)
         }).collect();
 
-        let times: Vec<(u32, u32, u32)> = self.times.iter()
-            .map(|(&(from, to), &cost)| (from.value(), to.value(), cost))
-            .collect();
+        let anchors: Vec<u32> = self.anchors.iter().map(|n| n.value()).collect();
 
-        let anchors: Vec<u32> = {
-            let mut seen = HashSet::new();
-            self.times.keys()
-                .map(|(from, _)| from.value())
-                .filter(|id| seen.insert(*id))
-                .collect()
-        };
-
-        RoutingSnapshot { nodes, edges, times, anchors }
+        RoutingSnapshot { nodes, edges, anchors, matrix: self.matrix.clone() }
     }
 
     /// Reconstruct a RoutingEngine from a cached snapshot (no Dijkstra needed).
@@ -251,11 +384,21 @@ impl RoutingEngine {
             .map(|nx| (graph[nx].id, nx))
             .collect();
 
-        let times: HashMap<(NodeId, NodeId), u32> = snap.times.into_iter()
-            .map(|(f, t, c)| ((NodeId::new(f), NodeId::new(t)), c))
+        let anchors: Vec<NodeId> = snap.anchors.iter().map(|&v| NodeId::new(v)).collect();
+        let anchor_index: HashMap<NodeId, u32> = anchors.iter().enumerate()
+            .map(|(i, &n)| (n, i as u32))
             .collect();
 
-        Self { graph, node_index, times, routes: RwLock::new(HashMap::new()) }
+        Self {
+            graph,
+            node_index,
+            anchors,
+            anchor_index,
+            matrix: snap.matrix,
+            routes:   RwLock::new(HashMap::new()),
+            costs:    RwLock::new(HashMap::new()),
+            counters: RouteCounters::default(),
+        }
     }
 
     fn compute_route(&self, from: NodeId, to: NodeId) -> Vec<NodeId> {
@@ -336,5 +479,58 @@ mod tests {
         let engine = RoutingEngine::from_hex_grid(&make_grid(3, 3));
         let a = NodeId::from_hex(&HexCoord::new(1, 1));
         assert_eq!(engine.route_between(a, a), vec![a]);
+    }
+
+    /// A line graph A—B—C—D with bidirectional, equal-weight edges. Node `i`
+    /// sits at lon `i*0.01`, lat 0 — far enough apart that a haversine estimate
+    /// is clearly distinct from the true path cost.
+    fn line_graph() -> (RoadGraph, Vec<NodeId>) {
+        let mut g = RoadGraph::new();
+        let ids: Vec<NodeId> = (0..4).map(NodeId::new).collect();
+        let nxs: Vec<NodeIndex> = ids.iter().enumerate()
+            .map(|(i, &id)| g.add_node(Node { id, position: Point::new(i as f64 * 0.01, 0.0) }))
+            .collect();
+        for &(a, b, w) in &[(0usize, 1usize, 2u32), (1, 2, 3), (2, 3, 4)] {
+            g.add_edge(nxs[a], nxs[b], Edge { travel_time_min: w });
+            g.add_edge(nxs[b], nxs[a], Edge { travel_time_min: w });
+        }
+        (g, ids)
+    }
+
+    #[test]
+    fn matrix_serves_anchor_pairs_both_directions() {
+        let (g, ids) = line_graph();
+        let engine = RoutingEngine::from_graph(g, &ids); // all nodes are anchors
+        // A → D via the matrix: 2 + 3 + 4 = 9.
+        assert_eq!(engine.travel_time(ids[0], ids[3]), 9);
+        // D → A is stored independently in the matrix (both directions): 9.
+        assert_eq!(engine.travel_time(ids[3], ids[0]), 9);
+        let s = engine.route_stats();
+        assert_eq!(s.source_forward, 2); // both answered by the matrix
+        assert_eq!(s.exact_computed, 0);
+    }
+
+    #[test]
+    fn non_anchor_pair_uses_exact_path_not_haversine() {
+        let (g, ids) = line_graph();
+        // Only A and D are anchors; B and C are not in the matrix.
+        let engine = RoutingEngine::from_graph(g, &[ids[0], ids[3]]);
+        // B → C: neither endpoint is an anchor → exact A* = 3.
+        // (A 30 km/h haversine over ~1.1 km would give ~2, so 3 proves the
+        // real path was used.)
+        assert_eq!(engine.travel_time(ids[1], ids[2]), 3);
+        assert_eq!(engine.route_stats().exact_computed, 1);
+    }
+
+    #[test]
+    fn disconnected_pair_falls_back_to_haversine() {
+        let (mut g, ids) = line_graph();
+        // An island node with no edges, ~70 km east of A.
+        let island = NodeId::new(99);
+        g.add_node(Node { id: island, position: Point::new(1.0, 0.0) });
+        let engine = RoutingEngine::from_graph(g, &ids); // island is not a source
+        // No path exists → A* fails → positive haversine estimate (not a panic).
+        assert!(engine.travel_time(ids[0], island) >= 1);
+        assert_eq!(engine.route_stats().haversine, 1);
     }
 }

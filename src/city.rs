@@ -108,7 +108,26 @@ impl City {
 
         if self.clock.elapsed_min >= self.next_flush {
             self.flush();
+            // Refresh the routing-resolution counters every flush so a run that
+            // is stopped or killed before the end-of-run write still leaves a
+            // populated `routing_stats` row for the report (single-row upsert).
+            self.write_routing_stats();
             self.next_flush = self.clock.elapsed_min + FLUSH_EVERY_MINS;
+        }
+    }
+
+    /// Persist the routing engine's travel-time resolution counters to the DB
+    /// so the report can show how often each tier (precomputed row / exact A* /
+    /// haversine) answered a query. All districts share one engine, so the first
+    /// district's stats cover the whole simulation.
+    ///
+    /// Note: in a multi-variant `SimBatch` the engine is shared across variants
+    /// running in parallel, so these counts are cumulative across the batch; for
+    /// the single-variant standard sim they are exact for that run.
+    pub fn write_routing_stats(&mut self) {
+        let Some(stats) = self.districts.first().map(|d| d.routing.route_stats()) else { return; };
+        if let Err(e) = self.event_log.write_routing_stats(&stats) {
+            eprintln!("warning: could not write routing stats: {e}");
         }
     }
 

@@ -309,6 +309,7 @@ fn run_event_loop(
         cb(sim_end_min.min(city.clock.elapsed_min), sim_end_min);
     }
     city.flush();
+    city.write_routing_stats();
 }
 
 // ---------------------------------------------------------------------------

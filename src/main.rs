@@ -57,17 +57,22 @@ fn run_standard(args: &[String]) {
         process::exit(1);
     });
 
+    // The no-variant standard run covers a fixed 30-day horizon regardless of the
+    // config's duration, so the headline KPIs are always over a comparable window.
+    const STANDARD_SIM_MINUTES: u64 = 30 * 24 * 60;
+
     println!(
-        "Config loaded — sim_type: {:?}, districts: {}, duration: {} min",
+        "Config loaded — sim_type: {:?}, districts: {}, duration: {} min (30-day standard run)",
         cfg.city.sim.sim_type,
         cfg.city.districts.len(),
-        cfg.city.sim.duration_minutes,
+        STANDARD_SIM_MINUTES,
     );
 
     let setup_start = Instant::now();
     let batch = SimBatch::from_config(cfg)
         .unwrap_or_else(|e| { eprintln!("error: {e}"); process::exit(1); })
         .with_variants(vec![Variant::identity("Standard sim")])
+        .with_duration(STANDARD_SIM_MINUTES)
         .with_db_pattern("./output/dispatch_sim.db");
     let setup_ms = setup_start.elapsed().as_millis();
     println!("Batch ready  [{setup_ms} ms setup]");

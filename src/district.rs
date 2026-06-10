@@ -228,7 +228,14 @@ impl District {
             .get(&hex_id)
             .map(|(nodes, profile)| (nodes, profile.clone()))
             .expect("hex_id not found in district");
-        let location = road_nodes[self.rng.random_range(0..road_nodes.len())];
+        // Place the incident at the cell's anchor node (`road_nodes[0]`, built
+        // anchor-first in city.rs from the optimizer's `nearest_osm_node`, which
+        // is filtered to the main connected component). Using the anchor — rather
+        // than a random in-cell node — makes every dispatch endpoint (station,
+        // patrol waypoint, incident) a precomputed anchor, so each travel-time
+        // query is an O(1) matrix lookup. At H3 res 9 (~174 m edge) the anchor-vs-
+        // random displacement is ~100 m ≈ ~10 s, zero-mean → negligible for KPIs.
+        let location = road_nodes[0];
 
         let profile  = &profiles[&spawn_profile_id];
         let kind     = sample_incident_kind(&profile.incident_weights, &mut self.rng);
@@ -724,6 +731,8 @@ impl District {
     /// Return the index of the nearest unit with the given status to `location`.
     /// `now` is needed to compute the live position of patrolling units.
     fn nearest_unit(&self, location: NodeId, status: UnitStatus, now: SimTime) -> Option<usize> {
+        // Every dispatch endpoint is a hex anchor, so `travel_time` is an O(1)
+        // matrix lookup — rank candidates by exact travel time directly.
         self.units.iter()
             .enumerate()
             .filter(|(_, u)| u.status == status)
@@ -741,8 +750,10 @@ impl District {
                 let assigned = u.assigned_incident.as_ref()?;
                 let inc = self.incidents.get(assigned)?;
                 if inc.priority.rank() < new_rank {
-                    let tt = self.routing.travel_time(u.current_position(now), location);
-                    Some((idx, assigned.clone(), inc.priority.rank(), tt))
+                    // Exact travel time for the nearest-on-tie ordering (O(1)
+                    // matrix lookup, since both endpoints are anchors).
+                    let dist = self.routing.travel_time(u.current_position(now), location);
+                    Some((idx, assigned.clone(), inc.priority.rank(), dist))
                 } else {
                     None
                 }
