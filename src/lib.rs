@@ -13,6 +13,7 @@ pub mod incident;
 pub mod optimizer;
 pub mod osm;
 pub mod patrol;
+pub mod profiles;
 pub mod report;
 pub mod routing;
 pub mod routing_cache;

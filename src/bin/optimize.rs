@@ -155,8 +155,8 @@ fn main() {
     // 5. Build H3Hex list (parallel OSM snap — O(log n) per cell via R-tree).
     println!("Snapping {} cells to nearest OSM nodes…", cells.len());
     let hexes: Vec<H3Hex> = cells.par_iter().map(|(cell, lat, lon)| {
-        // All cells start as "residential"; commercial/mixed zones can be added
-        // later via a GeoJSON overlay mapping lat/lon → profile_id.
+        // Cells start as "residential"; real land-use profiles (commercial/
+        // mixed) are assigned after solving from OSM POI density — see step 8b.
         let profile_id = "residential".to_string();
         let spawn_rate = spawn_cfg.spawn_profiles
             .get(&profile_id)
@@ -295,7 +295,7 @@ fn main() {
     println!("  → adjacency filtered");
 
     // 7c. Build problem.
-    let problem = Problem {
+    let mut problem = Problem {
         hexes,
         candidate_stations: candidates,
         n_districts: cfg.n_districts,
@@ -337,6 +337,32 @@ fn main() {
 
     if cfg.constraints.contiguity {
         println!("Contiguity: enforced");
+    }
+
+    // 8b. Assign land-use spawn profiles from OSM commercial-POI density.
+    //     Done after solving so it does not change the p-median districting
+    //     (which weights by spawn_rate); it only sets each hex's profile.
+    println!("Assigning spawn profiles from OSM land-use…");
+    let indices: Vec<u64> = problem.hexes.iter().map(|h| h.index).collect();
+    match dispatch_sim::profiles::classify_hexes(&indices, Path::new(&cfg.osm_path)) {
+        Ok(profiles) => {
+            let mut counts: HashMap<&str, usize> = HashMap::new();
+            for h in &mut problem.hexes {
+                if let Some(p) = profiles.get(&h.index) {
+                    h.profile_id = p.clone();
+                    h.spawn_rate = spawn_cfg.spawn_profiles
+                        .get(p)
+                        .map(|c| c.base_lambda / 60.0)
+                        .unwrap_or(h.spawn_rate);
+                }
+                *counts.entry(h.profile_id.as_str()).or_insert(0) += 1;
+            }
+            println!("  → residential {} / mixed {} / commercial {}",
+                     counts.get("residential").copied().unwrap_or(0),
+                     counts.get("mixed").copied().unwrap_or(0),
+                     counts.get("commercial").copied().unwrap_or(0));
+        }
+        Err(e) => eprintln!("warning: profile assignment failed ({e}); keeping residential"),
     }
 
     // 9. Write hexes.json.
