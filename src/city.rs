@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
-use h3o::{CellIndex, LatLng, Resolution};
+use h3o::CellIndex;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use rand::RngExt;
@@ -241,26 +241,6 @@ impl City {
         // happened in the optimizer; this loop just restores snapshots.
         let station_lookup = cfg.district_stations.by_district_id();
 
-        // Map every road node in the city-wide graph to its H3 cell so that
-        // each hex can hold all road nodes inside it (not just the anchor).
-        // Incidents spawn at a random node for spatial realism.
-        let nodes_by_h3: HashMap<u64, Vec<NodeId>> = {
-            let all_hexes: Vec<&crate::config::HexConfig> = cfg.hex_grid.hexes.iter().collect();
-            let resolution = all_hexes.first()
-                .and_then(|h| CellIndex::try_from(h.h3_index).ok())
-                .map(|c| c.resolution())
-                .unwrap_or(Resolution::Nine);
-
-            let mut map: HashMap<u64, Vec<NodeId>> = HashMap::new();
-            for (node_id, lon, lat) in engine.all_node_positions() {
-                if let Ok(ll) = LatLng::from_radians(lat.to_radians(), lon.to_radians()) {
-                    let cell = ll.to_cell(resolution);
-                    map.entry(u64::from(cell)).or_default().push(node_id);
-                }
-            }
-            map
-        };
-
         // Sequential build: this is one-shot deserialization (the expensive
         // Dijkstra work already happened in the optimizer), and the outer
         // whatif runners parallelise across whole sims — nesting rayon here
@@ -287,15 +267,9 @@ impl City {
                             .map(|&id| NodeId::new(id))
                             .or_else(|| h.nearest_osm_node.map(NodeId::new))
                             .expect("hex has no road node — rerun optimizer");
-                        // Collect all road nodes in this H3 cell, anchor first.
-                        let mut road_nodes = vec![anchor];
-                        if let Some(cell_nodes) = nodes_by_h3.get(&h.h3_index) {
-                            for &nid in cell_nodes {
-                                if nid != anchor {
-                                    road_nodes.push(nid);
-                                }
-                            }
-                        }
+                        // Incidents spawn at the cell anchor (the connected
+                        // representative node), so a single-node list suffices.
+                        let road_nodes = vec![anchor];
                         Hex {
                             id:                hex_id,
                             h3_index:          h.h3_index,
