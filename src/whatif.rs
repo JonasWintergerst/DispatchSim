@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 
 use crate::city::{self, City};
-use crate::config::LoadedConfig;
+use crate::config::{LoadedConfig, ServiceTimeRaw};
 use crate::routing::RoutingEngine;
 use crate::routing_cache::{self, LoadedRoutingCache};
 
@@ -38,6 +38,9 @@ pub struct Variant {
     pub patrol_routes_path: Option<String>,
     /// When `Some`, overrides `cfg.city.sim.mutual_aid_enabled`.
     pub mutual_aid: Option<bool>,
+    /// When `Some`, overrides the `[service_time]` section (per-priority
+    /// on-scene duration distributions). `None` keeps the base config's.
+    pub service_time: Option<ServiceTimeRaw>,
 }
 
 impl Variant {
@@ -49,6 +52,7 @@ impl Variant {
             unit_counts: None,
             patrol_routes_path: None,
             mutual_aid: None,
+            service_time: None,
         }
     }
 
@@ -59,7 +63,14 @@ impl Variant {
             unit_counts: Some(unit_counts),
             patrol_routes_path: None,
             mutual_aid: None,
+            service_time: None,
         }
+    }
+
+    /// Builder-style service-time override (used by the thesis sensitivity runs).
+    pub fn with_service_time(mut self, st: ServiceTimeRaw) -> Self {
+        self.service_time = Some(st);
+        self
     }
 }
 
@@ -278,6 +289,9 @@ impl SimBatch {
         if let Some(enabled) = variant.mutual_aid {
             cfg.city.sim.mutual_aid_enabled = Some(enabled);
         }
+        if let Some(st) = &variant.service_time {
+            cfg.city.service_time = Some(st.clone());
+        }
 
         cfg
     }
@@ -461,12 +475,14 @@ pub fn generate_patrol_variants(
         unit_counts:        Some(baseline_counts.clone()),
         patrol_routes_path: None,
         mutual_aid:         Some(false),
+        service_time:       None,
     });
     out.push(Variant {
         name:               "Mutual aid only".to_string(),
         unit_counts:        Some(baseline_counts.clone()),
         patrol_routes_path: None,
         mutual_aid:         Some(true),
+        service_time:       None,
     });
     for (label, path) in patrol_route_paths {
         out.push(Variant {
@@ -474,12 +490,14 @@ pub fn generate_patrol_variants(
             unit_counts:        Some(baseline_counts.clone()),
             patrol_routes_path: Some(path.clone()),
             mutual_aid:         Some(false),
+            service_time:       None,
         });
         out.push(Variant {
             name:               format!("Patrol: {label} + aid"),
             unit_counts:        Some(baseline_counts.clone()),
             patrol_routes_path: Some(path.clone()),
             mutual_aid:         Some(true),
+            service_time:       None,
         });
     }
     out

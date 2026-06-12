@@ -634,7 +634,13 @@ impl District {
         let mut to_escalate: Vec<(IncidentId, Priority)> = Vec::new();
         let mut to_cancel:   Vec<IncidentId> = Vec::new();
 
-        for inc in self.incidents.values() {
+        // Sort by id: HashMap iteration order varies per instance, and the
+        // cancellation roll below consumes the district RNG per visited
+        // incident — an unsorted sweep makes whole runs irreproducible.
+        let mut open: Vec<&Incident> = self.incidents.values().collect();
+        open.sort_by(|a, b| a.id.cmp(&b.id));
+
+        for inc in open {
             if inc.status != IncidentStatus::Open { continue; }
             let waited = time.0.saturating_sub(inc.spawned_at.0);
 

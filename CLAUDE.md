@@ -16,9 +16,10 @@ cargo clippy                                         # Lint
 cargo fmt                                            # Format code
 ```
 
-The project has two binaries — always use `--bin`:
+The main binaries — always use `--bin`:
 - **`optimize`** — p-median district optimizer; reads `config/optimize.toml`, writes `config/hexes.json`
 - **`dispatch_sim`** — discrete-event simulator; reads `config/city.toml` and `config/hexes.json`
+- **`thesis_runs`** — reruns the 7 thesis experiment scenarios (§6.5 reallocation, §6.6 service-time sensitivity) as one CRN-paired batch; optional arg = horizon in minutes (default 4 years) → `output/thesis_{0..6}.db`; KPIs via `thesis/extract_kpis.py <db>=<fleet>`
 
 The simulation outputs a SQLite database to `./output/dispatch_sim.db`.
 
