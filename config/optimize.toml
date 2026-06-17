@@ -1,0 +1,27 @@
+n_districts             = 24
+h3_resolution           = 9              # resolution 9 ≈ 174m edge (~7.5k hexes for Hamburg)
+                                         # resolution 10 ≈ 65m edge (~50k hexes — use SA solver)
+area_geojson            = "config/hamburg.geojson"
+osm_path                = "config/hamburg-latest.osm.pbf"
+hex_output_path         = "config/hexes.json"
+spawn_profiles_path     = "config/city.toml"
+
+# Station candidates for the p-median solver.
+# Defaults to config/police_stations.json (extracted from OSM by the optimizer itself).
+# Supply a custom file with additional candidate locations to expand the search space.
+station_candidates_path = "config/police_stations.json"
+
+# Output path for the district → station mapping consumed by the simulator.
+districts_output_path   = "config/districts.json"
+
+[constraints]
+contiguity          = true
+max_workload_ratio  = 1.5            # max district load / mean load
+
+[objective]
+travel_time_weight       = 1.0
+workload_balance_weight  = 0.2
+
+[solver]
+algorithm = "greedy"                 # "greedy" | "simulated_annealing"
+seed      = 42
