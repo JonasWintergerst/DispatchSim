@@ -18,3 +18,5 @@ thesis/*.run.xml
 thesis/*.lof
 thesis/*.lot
 thesis/*.bbl
+thesis/*.nav
+thesis/*.snm
