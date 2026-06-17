@@ -1,0 +1,32 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "Hamburg",
+    "note": "Simplified boundary for development. Replace with the real polygon from https://download.geofabrik.de/europe/germany/hamburg.html (extract from the .osm.pbf or use the Geofabrik GeoJSON boundary)."
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [9.731, 53.395],
+        [9.810, 53.359],
+        [9.900, 53.352],
+        [9.980, 53.360],
+        [10.090, 53.383],
+        [10.210, 53.402],
+        [10.330, 53.445],
+        [10.330, 53.530],
+        [10.280, 53.630],
+        [10.220, 53.700],
+        [10.100, 53.745],
+        [9.960, 53.745],
+        [9.850, 53.720],
+        [9.760, 53.680],
+        [9.730, 53.620],
+        [9.730, 53.530],
+        [9.731, 53.450],
+        [9.731, 53.395]
+      ]
+    ]
+  }
+}

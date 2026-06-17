@@ -1,0 +1,170 @@
+[
+  {
+    "district_id": 0,
+    "station_lat": 53.4725486,
+    "station_lon": 9.9886361,
+    "station_name": "Wasserschutzpolizeikommissariat 3",
+    "station_osm_node": 162508
+  },
+  {
+    "district_id": 1,
+    "station_lat": 53.552829900000006,
+    "station_lon": 10.007839,
+    "station_name": "Sicherheitswache",
+    "station_osm_node": 567297
+  },
+  {
+    "district_id": 2,
+    "station_lat": 53.651325400000005,
+    "station_lon": 10.0921525,
+    "station_name": "Polizeikommissariat 35",
+    "station_osm_node": 136885
+  },
+  {
+    "district_id": 3,
+    "station_lat": 53.4907806,
+    "station_lon": 10.2044233,
+    "station_name": "Polizeikommissariat 43",
+    "station_osm_node": 349465
+  },
+  {
+    "district_id": 4,
+    "station_lat": 53.59223600000001,
+    "station_lon": 9.9353925,
+    "station_name": "Polizeikommissariat 27",
+    "station_osm_node": 316677
+  },
+  {
+    "district_id": 5,
+    "station_lat": 53.4696148,
+    "station_lon": 9.8530098,
+    "station_name": "Polizeikommissariat 47",
+    "station_osm_node": 136251
+  },
+  {
+    "district_id": 6,
+    "station_lat": 53.5632079,
+    "station_lon": 10.078767,
+    "station_name": "Verkehrspolizeidirektion Hamburg-Ost",
+    "station_osm_node": 739983
+  },
+  {
+    "district_id": 7,
+    "station_lat": 53.5764925,
+    "station_lon": 9.8495407,
+    "station_name": "Polizeikommissariat 26",
+    "station_osm_node": 712636
+  },
+  {
+    "district_id": 8,
+    "station_lat": 53.5999425,
+    "station_lon": 10.1508862,
+    "station_name": "Polizeikommissariat 38",
+    "station_osm_node": 37347
+  },
+  {
+    "district_id": 9,
+    "station_lat": 53.526889700000005,
+    "station_lon": 9.928546,
+    "station_name": "Wasserschutzpolizeikommissariat 1",
+    "station_osm_node": 440529
+  },
+  {
+    "district_id": 10,
+    "station_lat": 53.6282452,
+    "station_lon": 10.0057786,
+    "station_name": "Bundespolizeiinspektion Flughafen Hamburg",
+    "station_osm_node": 369044
+  },
+  {
+    "district_id": 11,
+    "station_lat": 53.4602798,
+    "station_lon": 9.9855763,
+    "station_name": "Polizeikommissariat 46",
+    "station_osm_node": 428024
+  },
+  {
+    "district_id": 12,
+    "station_lat": 53.5070361,
+    "station_lon": 9.9918679,
+    "station_name": "Polizeikommissariat 44",
+    "station_osm_node": 373998
+  },
+  {
+    "district_id": 13,
+    "station_lat": 53.558744700000005,
+    "station_lon": 9.961821,
+    "station_name": "Polizeikommissariat 16",
+    "station_osm_node": 374140
+  },
+  {
+    "district_id": 14,
+    "station_lat": 53.5892368,
+    "station_lon": 10.0196281,
+    "station_name": "Polizeikommissariat 33",
+    "station_osm_node": 521371
+  },
+  {
+    "district_id": 15,
+    "station_lat": 53.538472500000005,
+    "station_lon": 10.1096485,
+    "station_name": "Polizeikommissariat 42",
+    "station_osm_node": 347307
+  },
+  {
+    "district_id": 16,
+    "station_lat": 53.6548254,
+    "station_lon": 10.0187594,
+    "station_name": "Polizeikommissariat 34",
+    "station_osm_node": 415630
+  },
+  {
+    "district_id": 17,
+    "station_lat": 53.6110211,
+    "station_lon": 10.079429,
+    "station_name": "Polizeikommissariat 36",
+    "station_osm_node": 509734
+  },
+  {
+    "district_id": 18,
+    "station_lat": 53.6244542,
+    "station_lon": 9.9560622,
+    "station_name": "Polizeikommissariat 24",
+    "station_osm_node": 317130
+  },
+  {
+    "district_id": 19,
+    "station_lat": 53.5253347,
+    "station_lon": 9.9726052,
+    "station_name": "Wasserschutzpolizeikommissariat 2",
+    "station_osm_node": 142870
+  },
+  {
+    "district_id": 20,
+    "station_lat": 53.5643213,
+    "station_lon": 9.9259507,
+    "station_name": "Polizei Hamburg, Verkehrsstaffel West",
+    "station_osm_node": 144369
+  },
+  {
+    "district_id": 21,
+    "station_lat": 53.585055100000005,
+    "station_lon": 9.9660828,
+    "station_name": "Polizeikommissariat 23",
+    "station_osm_node": 383130
+  },
+  {
+    "district_id": 22,
+    "station_lat": 53.55785040000001,
+    "station_lon": 10.0462282,
+    "station_name": "Polizeikommissariat 41",
+    "station_osm_node": 125225
+  },
+  {
+    "district_id": 23,
+    "station_lat": 53.570741000000005,
+    "station_lon": 10.0708957,
+    "station_name": "Polizeikommissariat 37",
+    "station_osm_node": 20108
+  }
+]
