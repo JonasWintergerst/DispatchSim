@@ -95,8 +95,17 @@ impl DashboardApp {
     fn new() -> Self {
         let hexes = data::load_hexes();
         let (lat_range, lon_range) = data::bounds(&hexes);
-        let stations = data::load_stations();
         let district_stations = data::load_district_stations();
+        // Only show stations the optimizer actually opened (one per district),
+        // not the full candidate set in config/police_stations.json.
+        let stations: Vec<StationEntry> = district_stations
+            .iter()
+            .map(|d| StationEntry {
+                name: d.station_name.clone(),
+                lat: d.station_lat,
+                lon: d.station_lon,
+            })
+            .collect();
         let isochrone_minutes: Vec<f32> = hexes
             .iter()
             .map(|h| data::min_travel_min(h.lat, h.lon, &district_stations))

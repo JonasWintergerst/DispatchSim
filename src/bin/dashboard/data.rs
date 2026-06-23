@@ -34,17 +34,6 @@ pub fn load_hexes() -> Vec<HexEntry> {
     serde_json::from_str(&buf).unwrap_or_default()
 }
 
-pub fn load_stations() -> Vec<StationEntry> {
-    let path = "config/police_stations.json";
-    let mut file = match std::fs::File::open(path) {
-        Ok(f)  => f,
-        Err(_) => return Vec::new(),
-    };
-    let mut buf = String::new();
-    file.read_to_string(&mut buf).ok();
-    serde_json::from_str(&buf).unwrap_or_default()
-}
-
 pub fn load_district_stations() -> Vec<DistrictEntry> {
     let path = "config/districts.json";
     let mut file = match std::fs::File::open(path) {
