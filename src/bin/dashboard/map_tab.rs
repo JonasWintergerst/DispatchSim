@@ -153,29 +153,37 @@ pub fn draw_hex_map(
     }
 
     // ── Station markers ─────────────────────────────────────────────────
+    // Each opened station is labelled with its district number and tinted in
+    // the district color, so it lines up with the hex colors and the legend.
     let dot_r = ((inner.width() / lon_span as f32) * 0.0015).clamp(1.5, 6.0);
+    let marker_r = (dot_r + 5.0).max(8.0);
     for station in stations {
         let x = inner.left() + ((station.lon - lon_min) / lon_span) as f32 * inner.width();
         let y =
             inner.bottom() - ((station.lat - lat_min) / lat_span) as f32 * inner.height();
         let pos = Pos2::new(x, y);
-        painter.circle_filled(pos, dot_r + 4.0, Color32::BLACK);
-        painter.circle_filled(pos, dot_r + 3.0, Color32::from_rgb(255, 215, 0));
+        let color = district_color(station.district_id);
+        painter.circle_filled(pos, marker_r + 1.5, Color32::BLACK);
+        painter.circle_filled(pos, marker_r, color);
+        painter.circle_stroke(pos, marker_r, Stroke::new(1.5, Color32::WHITE));
+        // Pick black/white label for contrast against the district color.
+        let lum = 0.299 * color.r() as f32 + 0.587 * color.g() as f32 + 0.114 * color.b() as f32;
+        let text_col = if lum > 140.0 { Color32::BLACK } else { Color32::WHITE };
         painter.text(
             pos,
             egui::Align2::CENTER_CENTER,
-            "★",
-            egui::FontId::proportional(10.0),
-            Color32::BLACK,
+            station.district_id.to_string(),
+            egui::FontId::proportional(11.0),
+            text_col,
         );
-        let rect = Rect::from_center_size(pos, Vec2::splat((dot_r + 4.0) * 2.0));
+        let rect = Rect::from_center_size(pos, Vec2::splat((marker_r + 1.5) * 2.0));
         if ui.rect_contains_pointer(rect) {
             egui::show_tooltip_at_pointer(
                 ui.ctx(),
                 ui.layer_id(),
                 egui::Id::new(&station.name),
                 |ui| {
-                    ui.label(&station.name);
+                    ui.label(format!("District {} — {}", station.district_id, station.name));
                 },
             );
         }

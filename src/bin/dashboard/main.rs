@@ -104,6 +104,7 @@ impl DashboardApp {
                 name: d.station_name.clone(),
                 lat: d.station_lat,
                 lon: d.station_lon,
+                district_id: d.district_id,
             })
             .collect();
         let isochrone_minutes: Vec<f32> = hexes

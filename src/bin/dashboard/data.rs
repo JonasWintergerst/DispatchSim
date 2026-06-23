@@ -13,6 +13,7 @@ pub struct StationEntry {
     pub name: String,
     pub lat: f64,
     pub lon: f64,
+    pub district_id: u32,
 }
 
 #[derive(Deserialize)]
