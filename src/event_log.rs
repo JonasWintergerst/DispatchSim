@@ -49,6 +49,34 @@ impl EventKind {
     }
 }
 
+/// Which dispatch path produced a `UnitDispatched` event. `Idle`, `Patrolling`,
+/// `Returning`, and `Preempt` are the four branches of the spawn-time dispatch
+/// rule (closest available unit, then preempt a lower-priority dispatch).
+/// `MutualAid` is a cross-border loan; `Queued` is a freed unit sent straight
+/// to a previously-queued incident.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSource {
+    Idle,
+    Patrolling,
+    Returning,
+    Preempt,
+    MutualAid,
+    Queued,
+}
+
+impl DispatchSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DispatchSource::Idle       => "Idle",
+            DispatchSource::Patrolling => "Patrolling",
+            DispatchSource::Returning  => "Returning",
+            DispatchSource::Preempt    => "Preempt",
+            DispatchSource::MutualAid  => "MutualAid",
+            DispatchSource::Queued     => "Queued",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Event {
     pub sim_time: u64,
@@ -60,6 +88,8 @@ pub struct Event {
     pub priority: Option<String>,
     /// "Fire", "MedicalEmergency", "Crime", "Accident" — populated only for IncidentSpawned.
     pub incident_kind: Option<String>,
+    /// Which dispatch path was taken — populated only for UnitDispatched events.
+    pub dispatch_source: Option<DispatchSource>,
 }
 
 pub struct EventLog {
@@ -83,7 +113,8 @@ impl EventLog {
                 unit          INTEGER,
                 incident      TEXT,
                 priority      TEXT,
-                incident_kind TEXT
+                incident_kind TEXT,
+                dispatch_source TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_sim_time  ON events (sim_time);
@@ -136,8 +167,8 @@ impl EventLog {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO events (sim_time, kind, district, unit, incident, priority, incident_kind)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO events (sim_time, kind, district, unit, incident, priority, incident_kind, dispatch_source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
 
             for e in events {
@@ -149,6 +180,7 @@ impl EventLog {
                     e.incident.as_ref().map(|i| i.value()),
                     e.priority.as_deref(),
                     e.incident_kind.as_deref(),
+                    e.dispatch_source.as_ref().map(|s| s.as_str()),
                 ])?;
             }
         }

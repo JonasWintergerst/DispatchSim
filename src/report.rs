@@ -17,6 +17,7 @@ pub fn print_report(db_path: &str) -> Result<()> {
     println!("Database: {}\n", db_path);
 
     print_overview(&conn)?;
+    print_dispatch_sources(&conn)?;
     print_sla_compliance(&conn)?;
     print_response_times(&conn)?;
     print_on_scene_duration(&conn)?;
@@ -127,6 +128,73 @@ fn print_overview(conn: &Connection) -> Result<()> {
     println!("  Escalated:     {:>12}", fmt_int(escalated));
     println!("  Cancelled:     {:>12}  ({:.1}% self-resolved)", fmt_int(cancelled), cancel_pct);
     println!("  Open / queued: {:>12}  ({:.1}% unresolved)", fmt_int(open), open_pct);
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch sources  (which path served each dispatch)
+// ---------------------------------------------------------------------------
+
+/// Break down every `UnitDispatched` event by the path that produced it: the
+/// four spawn-time rule branches (Idle / Patrolling / Returning / Preempt),
+/// cross-border Mutual aid, and Queued (a freed unit sent to an incident that
+/// had been waiting). The buckets reconcile to the total dispatch count.
+fn print_dispatch_sources(conn: &Connection) -> Result<()> {
+    // Add the column if this DB predates dispatch-source logging.
+    let _ = conn.execute_batch("ALTER TABLE events ADD COLUMN dispatch_source TEXT;");
+
+    let mut stmt = conn.prepare(
+        "SELECT dispatch_source, COUNT(*) FROM events
+         WHERE kind = 'UnitDispatched'
+         GROUP BY dispatch_source",
+    )?;
+    let rows: Vec<(Option<String>, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let total: i64 = rows.iter().map(|(_, n)| *n).sum();
+    if total == 0 {
+        println!("\nDispatch Sources — no dispatches recorded");
+        return Ok(());
+    }
+
+    let count_of = |label: &str| -> i64 {
+        rows.iter().find(|(s, _)| s.as_deref() == Some(label)).map(|(_, n)| *n).unwrap_or(0)
+    };
+    let pct = |x: i64| x as f64 / total as f64 * 100.0;
+
+    println!("\nDispatch Sources  (how each dispatch was served)");
+    println!("  {:<22} {:>12} {:>8}", "Source", "N", "%");
+
+    // The five named buckets, in a fixed, meaningful order. The stored label is
+    // the `DispatchSource` enum name; the second item is the display string.
+    const NAMED: &[(&str, &str)] = &[
+        ("Idle",       "Idle"),
+        ("Patrolling", "Patrolling"),
+        ("Returning",  "Returning"),
+        ("Preempt",    "Preempt"),
+        ("MutualAid",  "Mutual aid"),
+    ];
+    for (label, display) in NAMED {
+        let n = count_of(label);
+        println!("  {:<22} {:>12} {:>7.1}%", display, fmt_int(n), pct(n));
+    }
+
+    // Queued (freed unit → previously-queued incident): show only if present.
+    let queued = count_of("Queued");
+    if queued > 0 {
+        println!("  {:<22} {:>12} {:>7.1}%", "Queued (served later)", fmt_int(queued), pct(queued));
+    }
+
+    // Rows from older DBs that were logged before sources existed.
+    let unlabeled: i64 = rows.iter().filter(|(s, _)| s.is_none()).map(|(_, n)| *n).sum();
+    if unlabeled > 0 {
+        println!("  {:<22} {:>12} {:>7.1}%", "(unlabeled)", fmt_int(unlabeled), pct(unlabeled));
+    }
+
+    println!("  {:<22} {:>12}", "Total", fmt_int(total));
 
     Ok(())
 }

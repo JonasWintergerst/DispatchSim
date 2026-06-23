@@ -72,7 +72,7 @@ cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # step 3: report
 
 ### Event Processing Flow (per district)
 
-- **IncidentSpawn** → create `Incident`, find a unit to dispatch (idle → returning → preempt lower-priority dispatched), emit `UnitArrival`; if no unit available, push to `pending_queue`; schedule next spawn via exponential draw
+- **IncidentSpawn** → create `Incident`, find a unit to dispatch (closest idle/patrolling/returning → preempt lower-priority dispatched), emit `UnitArrival`; if no unit available, push to `pending_queue`; schedule next spawn via exponential draw
 - **UnitArrival** → stale-check `dispatch_id`; if valid, set unit to `OnScene`, sample resolution duration, emit `IncidentResolve`
 - **IncidentResolve** → mark incident `Resolved`; check `pending_queue` for waiting incidents — if found, dispatch unit directly from scene; otherwise emit `UnitReturn` and set unit to `Returning`
 - **UnitReturn** → stale-check `dispatch_id`; if valid, move unit to home station, set `Idle`; check `pending_queue` and dispatch immediately if something is waiting
@@ -82,10 +82,9 @@ cargo run --bin dispatch_sim -- report output/dispatch_sim.db  # step 3: report
 ### Dispatch Priority & Preemption
 
 Units are assigned using this precedence on every `IncidentSpawn`:
-1. **Idle** unit — dispatched immediately
-2. **Returning** unit — redirected en route back to station
-3. **Preemption** — if new incident has higher priority than any currently-dispatched unit's incident, that unit is redirected; the preempted incident returns to `pending_queue`
-4. **Queue** — incident added to `pending_queue` if no unit is available
+1. **Closest available unit** — all **Idle**, **Patrolling**, and **Returning** units are pooled together and ranked purely by travel time to the incident; the nearest is dispatched (so a nearby patrolling/returning unit beats a distant idle one)
+2. **Preemption** — if no unit is available and the new incident has higher priority than any currently-dispatched unit's incident, that unit is redirected; the preempted incident returns to `pending_queue`
+3. **Queue** — incident added to `pending_queue` if no unit is available
 
 `pending_queue` is a `Vec<IncidentId>`; `pop_best_pending()` always selects the highest-priority (`A > B > C`) open incident regardless of arrival order.
 

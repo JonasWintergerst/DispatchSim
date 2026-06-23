@@ -5,7 +5,7 @@ use rand::RngExt;
 use rand::rngs::SmallRng;
 
 use crate::clock::SimTime;
-use crate::event_log::{Event, EventKind, RouteRecord};
+use crate::event_log::{DispatchSource, Event, EventKind, RouteRecord};
 use crate::event_queue::SimEvent;
 use crate::hex::Hex;
 use crate::incident::Incident;
@@ -194,6 +194,7 @@ impl District {
                     incident:      Some(request.incident_id.clone()),
                     priority:      None,
                     incident_kind: None,
+                    dispatch_source: None,
                 },
                 None,
             ));
@@ -261,12 +262,13 @@ impl District {
                 incident: Some(incident_id.clone()),
                 priority: Some(priority_str(priority)),
                 incident_kind: Some(kind_str(kind)),
+                dispatch_source: None,
             },
             None,
         ));
 
-        // Try to dispatch a local unit. The dispatch helper handles
-        // Idle / Patrolling / Returning / preemption precedence.
+        // Try to dispatch a local unit. The dispatch helper picks the closest
+        // available unit (Idle / Patrolling / Returning), then preemption.
         let dispatched = self.try_dispatch_pending(incident_id.clone(), time, &mut out.events, /*loaned*/ false);
 
         if !dispatched {
@@ -300,25 +302,33 @@ impl District {
             None      => return false,
         };
 
-        // Precedence: Idle → Patrolling → Returning → preempt-lower-priority.
-        let dispatch_idx = if let Some(idx) = self.nearest_unit(location, UnitStatus::Idle, time) {
-            Some(idx)
-        } else if let Some(idx) = self.nearest_unit(location, UnitStatus::Patrolling, time) {
-            Some(idx)
-        } else if let Some(idx) = self.nearest_unit(location, UnitStatus::Returning, time) {
-            Some(idx)
+        // Precedence: closest available unit (Idle / Patrolling / Returning),
+        // then preempt-lower-priority as a fallback. The chosen branch also
+        // determines the dispatch source recorded on the log event.
+        let picked = if let Some(idx) = self.nearest_available_unit(location, time) {
+            let source = match self.units[idx].status {
+                UnitStatus::Idle       => DispatchSource::Idle,
+                UnitStatus::Patrolling => DispatchSource::Patrolling,
+                UnitStatus::Returning  => DispatchSource::Returning,
+                // nearest_available_unit only returns these three statuses.
+                _                      => DispatchSource::Idle,
+            };
+            Some((idx, source))
         } else if let Some((idx, old_id)) = self.find_preemptable(new_rank, location, time) {
             let old_rank = self.incidents.get(&old_id).map(|i| i.priority.rank()).unwrap_or(0);
             if let Some(inc) = self.incidents.get_mut(&old_id) {
                 inc.status = IncidentStatus::Open;
             }
             self.pending_queue.push(PendingIncident { rank: old_rank, id: old_id });
-            Some(idx)
+            Some((idx, DispatchSource::Preempt))
         } else {
             None
         };
 
-        let Some(idx) = dispatch_idx else { return false; };
+        let Some((idx, mut source)) = picked else { return false; };
+        // A loan overrides the branch-based label: the lender unit's status is
+        // not what we want to attribute a cross-border dispatch to.
+        if loaned { source = DispatchSource::MutualAid; }
 
         let from        = self.units[idx].current_position(time);
         let tt          = self.routing.travel_time(from, location) as u64;
@@ -341,7 +351,7 @@ impl District {
         }
         out.push((
             SimEvent::UnitArrival { time: arrival, unit_id, incident_id: incident_id.clone(), district_id: self.id, dispatch_id },
-            Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(incident_id), priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(incident_id), priority: None, incident_kind: None, dispatch_source: Some(source) },
             route,
         ));
         true
@@ -380,7 +390,7 @@ impl District {
 
         out.push((
             SimEvent::IncidentResolve { time: resolve_time, incident_id: incident_id.clone(), district_id: self.id },
-            Event { sim_time: time.0, kind: EventKind::UnitArrived, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::UnitArrived, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None, dispatch_source: None },
             None,
         ));
     }
@@ -400,7 +410,7 @@ impl District {
             // us a synthetic IncidentResolve to clean up — that's the path we
             // hit when `removed.is_some()` and we have no local unit; (b) the
             // unit was reassigned. Either way, just log and exit.
-            out.push((SimEvent::NoOp, Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: None, incident: Some(incident_id.clone()), priority: None, incident_kind: None }, None));
+            out.push((SimEvent::NoOp, Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: None, incident: Some(incident_id.clone()), priority: None, incident_kind: None, dispatch_source: None }, None));
             return;
         };
         let unit_id = self.units[unit_idx].id;
@@ -414,7 +424,7 @@ impl District {
         if !was_loaned {
             out.push((
                 SimEvent::NoOp,
-                Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
+                Event { sim_time: time.0, kind: EventKind::IncidentResolved, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None, dispatch_source: None },
                 None,
             ));
         }
@@ -432,7 +442,7 @@ impl District {
                     // Don't log a resolve here — the owner will log it when it
                     // processes the synthetic event.  Use UnitReturning as a
                     // lightweight marker so the Out tuple is satisfied.
-                    Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None },
+                    Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: Some(incident_id.clone()), priority: None, incident_kind: None, dispatch_source: None },
                     None,
                 ));
             }
@@ -464,7 +474,7 @@ impl District {
             }
             out.push((
                 SimEvent::UnitArrival { time: arrival, unit_id, incident_id: pending_id.clone(), district_id: self.id, dispatch_id },
-                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id), priority: None, incident_kind: None },
+                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id), priority: None, incident_kind: None, dispatch_source: Some(DispatchSource::Queued) },
                 route,
             ));
         } else {
@@ -503,7 +513,7 @@ impl District {
             let return_time = SimTime(time.0 + tt);
             out.push((
                 SimEvent::UnitReturn { time: return_time, unit_id, district_id: self.id, dispatch_id },
-                Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None },
+                Event { sim_time: time.0, kind: EventKind::UnitReturning, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None, dispatch_source: None },
                 None,
             ));
         }
@@ -527,7 +537,7 @@ impl District {
 
         out.push((
             SimEvent::NoOp,
-            Event { sim_time: time.0, kind: EventKind::UnitReturned, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::UnitReturned, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None, dispatch_source: None },
             None,
         ));
 
@@ -548,7 +558,7 @@ impl District {
             }
             out.push((
                 SimEvent::UnitArrival { time: arrival, unit_id, incident_id: pending_id.clone(), district_id: self.id, dispatch_id: did },
-                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id), priority: None, incident_kind: None },
+                Event { sim_time: time.0, kind: EventKind::UnitDispatched, district: self.id, unit: Some(unit_id), incident: Some(pending_id), priority: None, incident_kind: None, dispatch_source: Some(DispatchSource::Queued) },
                 route,
             ));
             return;
@@ -598,7 +608,7 @@ impl District {
         let next = SimTime(time.0 + total);
         out.push((
             SimEvent::PatrolLoop { time: next, unit_id, district_id: self.id, dispatch_id: did },
-            Event { sim_time: time.0, kind: EventKind::PatrolStarted, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::PatrolStarted, district: self.id, unit: Some(unit_id), incident: None, priority: None, incident_kind: None, dispatch_source: None },
             None,
         ));
     }
@@ -608,7 +618,7 @@ impl District {
         // Future: rotate on/off-duty crew here.
         out.push((
             SimEvent::ShiftChange { time: SimTime(time.0 + SHIFT_MINUTES), district_id: self.id },
-            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None, dispatch_source: None },
             None,
         ));
     }
@@ -625,7 +635,7 @@ impl District {
                 time:        SimTime(time.0 + esc_cfg.interval_min),
                 district_id: self.id,
             },
-            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None },
+            Event { sim_time: time.0, kind: EventKind::ShiftStarted, district: self.id, unit: None, incident: None, priority: None, incident_kind: None, dispatch_source: None },
             None,
         ));
 
@@ -681,6 +691,7 @@ impl District {
                     incident:      Some(id.clone()),
                     priority:      None,
                     incident_kind: None,
+                    dispatch_source: None,
                 },
                 None,
             ));
@@ -708,6 +719,7 @@ impl District {
                         incident:      Some(id.clone()),
                         priority:      Some(format!("{}→{}", old_pri, new_pri)),
                         incident_kind: None,
+                        dispatch_source: None,
                     },
                     None,
                 ));
@@ -734,14 +746,20 @@ impl District {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    /// Return the index of the nearest unit with the given status to `location`.
-    /// `now` is needed to compute the live position of patrolling units.
-    fn nearest_unit(&self, location: NodeId, status: UnitStatus, now: SimTime) -> Option<usize> {
+    /// Return the index of the nearest unit available for dispatch to
+    /// `location`. A unit is available if it is Idle, Patrolling, or Returning;
+    /// all three are pooled together and ranked purely by travel time, so a
+    /// nearby patrolling unit is preferred over a distant idle one. `now` is
+    /// needed to compute the live position of patrolling units.
+    fn nearest_available_unit(&self, location: NodeId, now: SimTime) -> Option<usize> {
         // Every dispatch endpoint is a hex anchor, so `travel_time` is an O(1)
         // matrix lookup — rank candidates by exact travel time directly.
         self.units.iter()
             .enumerate()
-            .filter(|(_, u)| u.status == status)
+            .filter(|(_, u)| matches!(
+                u.status,
+                UnitStatus::Idle | UnitStatus::Patrolling | UnitStatus::Returning
+            ))
             .min_by_key(|(_, u)| self.routing.travel_time(u.current_position(now), location))
             .map(|(idx, _)| idx)
     }
@@ -995,6 +1013,19 @@ mod tests {
         let popped = d.pop_best_pending();
         assert_eq!(popped.as_ref().map(|i| i.value()), Some("inc-c"),
             "preempted incident must be re-queued");
+
+        // Step 4: the dispatch sources were logged correctly — the C call took
+        // the idle unit, the A call preempted that dispatch.
+        let source_for = |inc: &str| out.iter().find_map(|(_, e, _)| {
+            if matches!(e.kind, EventKind::UnitDispatched)
+                && e.incident.as_ref().map(|i| i.value()) == Some(inc) {
+                e.dispatch_source
+            } else { None }
+        });
+        assert_eq!(source_for("inc-c"), Some(DispatchSource::Idle),
+            "the C call took the idle unit");
+        assert_eq!(source_for("inc-a"), Some(DispatchSource::Preempt),
+            "the A call preempted a lower-priority dispatch");
     }
 
     /// Mutual aid acceptance: a lender district with an idle unit accepts a
@@ -1023,5 +1054,30 @@ mod tests {
         assert_eq!(u.assigned_incident.as_ref().map(|i| i.value()), Some("foreign-1"));
         assert_eq!(u.loaned_to, Some(requester),
             "lender unit must remember which district it was loaned to");
+
+        let src = out.iter().find_map(|(_, e, _)| {
+            if matches!(e.kind, EventKind::UnitDispatched) { e.dispatch_source } else { None }
+        });
+        assert_eq!(src, Some(DispatchSource::MutualAid),
+            "a cross-border loan is labeled MutualAid regardless of lender unit status");
+    }
+
+    /// A fresh incident served by an idle unit is logged with the `Idle`
+    /// dispatch source.
+    #[test]
+    fn idle_dispatch_source_is_idle() {
+        let mut d = test_district(1);
+        let loc = NodeId::from_hex(&HexCoord::new(2, 2));
+        insert_incident(&mut d, "inc-1", Priority::B, loc, SimTime(0));
+
+        let mut out: Out = Vec::new();
+        assert!(d.try_dispatch_pending(
+            IncidentId::new("inc-1".into()), SimTime(0), &mut out, false,
+        ), "idle unit should accept the dispatch");
+
+        let src = out.iter().find_map(|(_, e, _)| {
+            if matches!(e.kind, EventKind::UnitDispatched) { e.dispatch_source } else { None }
+        });
+        assert_eq!(src, Some(DispatchSource::Idle));
     }
 }
