@@ -4,19 +4,6 @@ hamburg-260331.osm.pbf
 hamburg-latest.osm.pbf
 config/
 
-# LaTeX build artefacts (track sources + .pdf, not intermediates)
-thesis/*.aux
-thesis/*.log
-thesis/*.out
-thesis/*.toc
-thesis/*.fls
-thesis/*.fdb_latexmk
-thesis/*.synctex.gz
-thesis/*.bcf
-thesis/*.blg
-thesis/*.run.xml
-thesis/*.lof
-thesis/*.lot
-thesis/*.bbl
-thesis/*.nav
-thesis/*.snm
+# Seminararbeit bleibt privat: das Repo ist oeffentlich, thesis/ wird komplett
+# ignoriert (Quellen, PDFs und Build-Artefakte gleichermassen).
+thesis/
